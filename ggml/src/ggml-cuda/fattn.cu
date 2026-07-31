@@ -330,8 +330,9 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE    =   0,
-    BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
+    BEST_FATTN_KERNEL_TILE    = 200,
+    BEST_FATTN_KERNEL_SM70    = 300,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 
@@ -495,7 +496,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (Q->ne[1] * gqa_ratio_eff <= 16) {
             return BEST_FATTN_KERNEL_TILE; // On Volta tensor cores are only faster for sufficiently large matrices.
         }
-        return BEST_FATTN_KERNEL_MMA_F16;
+        // Volta (sm_70): route to CUTLASS-based SM70 kernel
+        return BEST_FATTN_KERNEL_SM70;
     }
 
     // AMD MFMA needs a certain minimum batch size to outscale the tile kernel for large head sizes.
@@ -557,6 +559,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
+        case BEST_FATTN_KERNEL_SM70:
+            // SM70 CUTLASS kernel dequantizes KV cache on-the-fly,
+            // no pre-conversion to f16 needed.
+            break;
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -565,6 +571,14 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
 
     return f16_extra.end - (uintptr_t) dst->data;
+}
+
+//
+// SM70 (Volta) CUTLASS-based flash attention kernel
+// TODO: implement in Phase 2+
+//
+static void ggml_cuda_flash_attn_ext_sm70(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_ABORT("flash_attn_ext_sm70: not yet implemented");
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -577,6 +591,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_VEC:
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_SM70:
+            ggml_cuda_flash_attn_ext_sm70(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);

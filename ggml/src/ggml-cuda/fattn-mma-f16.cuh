@@ -1725,7 +1725,10 @@ static __global__ void flash_attn_ext_f16(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
     ggml_cuda_pdl_sync(); // TODO optimize placement
-#if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
+#if defined(FLASH_ATTN_AVAILABLE)
+
+// Ampere+ (sm_80+): cp.async MMA kernel path
+#if __CUDA_ARCH__ >= 800
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;
     const char * GGML_CUDA_RESTRICT V        = V_ptr;
@@ -1889,7 +1892,18 @@ static __global__ void flash_attn_ext_f16(
               ne31, ne32, ne33,
               nb31, nb32, nb33);
     NO_DEVICE_CODE;
-#endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
+#elif __CUDA_ARCH__ >= 700
+    //
+    // Volta (sm_70): CUTLASS 2.x-based flash attention kernel
+    // TODO: implement in Phase 2+
+    //
+    NO_DEVICE_CODE;
+    return;
+#else
+    NO_DEVICE_CODE;
+    return;
+#endif // __CUDA_ARCH__
+#endif // FLASH_ATTN_AVAILABLE
 }
 
 template <int DKQ, int DV, int ncols1, int ncols2>
