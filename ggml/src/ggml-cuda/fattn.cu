@@ -3,6 +3,7 @@
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
+#include "fattn-wmma.cuh"
 #include "fattn.cuh"
 
 template <int DKQ, int DV, int ncols2>
@@ -573,16 +574,13 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
-// SM70 (Volta) CUTLASS-based flash attention kernel
+// SM70 (Volta) WMMA flash attention kernel
 static void ggml_cuda_flash_attn_ext_sm70(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    const ggml_tensor * mask = dst->src[3];
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-
-    GGML_UNUSED(mask);
 
     GGML_ASSERT(volta_mma_available(cc));
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
@@ -595,11 +593,7 @@ static void ggml_cuda_flash_attn_ext_sm70(ggml_backend_cuda_context & ctx, ggml_
     GGML_ASSERT(D  <= 128);
     GGML_ASSERT(Dv <= 128);
 
-    // Shared-memory budget tuning is handled by the existing
-    // GGML_CUDA_FATTN_MMA_CONFIG_CASE auto-tuning mechanism.
-
-    // TODO: launch fused SM70 flash attention kernel (Phases 3-5)
-    GGML_ABORT("flash_attn_ext_sm70: not yet implemented");
+    ggml_cuda_flash_attn_ext_wmma_sm70(ctx, dst);
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
