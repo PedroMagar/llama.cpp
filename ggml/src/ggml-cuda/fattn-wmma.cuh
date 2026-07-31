@@ -286,12 +286,9 @@ static __global__ void flash_attn_ext_f16_sm70(
     float row_max[WMMA_M];
     float row_sum[WMMA_M];
     constexpr int DV_tiles = DV / WMMA_K;
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tiles];
+wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tiles];
 
-    // Shared memory: rescale buffer at end of tile_KV
-    float * tile_rescale = (float *)(tile_KV + nbatch_fa * (stride_K_h > stride_V_h ? stride_K_h : stride_V_h));
-
-// Initialize softmax state
+    // Initialize softmax state
     if (warp_q_row < ncols) {
         #pragma unroll
         for (int i = 0; i < WMMA_M; ++i) {
@@ -541,7 +538,7 @@ static __global__ void flash_attn_ext_f16_sm70(
     }
 
     GGML_UNUSED_VARS(KV_max_ptr, dst_meta_ptr,
-        ne00, ne13, nb12, nb13, nb22, nb23,
+        ne00, ne10, ne13, nb03, nb12, nb13, nb22, nb23,
         ne31, ne32, nb32);
 
 #else
