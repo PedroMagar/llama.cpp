@@ -314,11 +314,27 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
                 const int head = (warp_q_row + r) % ncols2;
                 const float sink = sinks_f[head];
                 const float new_max = fmaxf(row_max[r], sink);
-                const float max_diff = row_max[r] - new_max;
-                float scale = expf(max_diff);
-                *((uint32_t *)&scale) *= max_diff >= SOFTMAX_FTZ_THRESHOLD;
-                row_max[r] = new_max;
-                row_sum[r] = row_sum[r] * scale + expf(sink - new_max);
+                if (new_max > row_max[r]) {
+                    const float max_diff = row_max[r] - new_max;
+                    float scale = expf(max_diff);
+                    *((uint32_t *)&scale) *= max_diff >= SOFTMAX_FTZ_THRESHOLD;
+                    #pragma unroll
+                    for (int t = 0; t < DV_tiles; ++t) {
+                        wmma::store_matrix_sync(
+                            (half *)tile_rescale, VKQ_acc[t], WMMA_N, wmma::mem_row_major);
+                        __syncthreads();
+                        if (threadIdx.x < WMMA_N) {
+                            tile_rescale[(r % WMMA_N) * WMMA_N + threadIdx.x] *= scale;
+                        }
+                        __syncthreads();
+                        wmma::load_matrix_sync(
+                            VKQ_acc[t], (half *)tile_rescale, WMMA_N, wmma::mem_row_major);
+                    }
+                    row_max[r] = new_max;
+                    row_sum[r] = row_sum[r] * scale + expf(sink - new_max);
+                } else {
+                    row_sum[r] += expf(sink - row_max[r]);
+                }
             }
         }
     }
@@ -568,7 +584,6 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70_case(ggml_backend_cuda_context & 
     // Volta WMMA (m16n16k16): 256 threads (8 warps x 32), occupancy 2
     constexpr int nthreads  = 256;
     constexpr int nwarps    = nthreads / 32;
-    constexpr int occupancy = 2;
 
     // Compute proper dynamic shared memory size
     constexpr int stride_Q_h = DKQ + WMMA_PADDING;
