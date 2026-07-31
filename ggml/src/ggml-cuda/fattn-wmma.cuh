@@ -281,7 +281,6 @@ static __global__ void flash_attn_ext_f16_sm70(
     // Warp distribution across Q rows
     const int warp_id    = threadIdx.y;
     const int warp_q_row = warp_id * WMMA_M;
-    const int nwarps_active = ncols / WMMA_M;
 
     // Per-warp online softmax state
     float row_max[WMMA_M];
@@ -542,10 +541,8 @@ static __global__ void flash_attn_ext_f16_sm70(
     }
 
     GGML_UNUSED_VARS(KV_max_ptr, dst_meta_ptr,
-        max_bias, m0, m1, n_head_log2, ne00, ne02, ne03,
-        ne11, ne12, ne13, nb12, nb13, nb22, nb23,
-        ne31, ne32, ne33, nb31, nb32, nb33, slope,
-        nwarps_active, iter_k, tiles_per_seq);
+        ne00, ne13, nb12, nb13, nb22, nb23,
+        ne31, ne32, nb32);
 
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
@@ -605,57 +602,57 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70_case(ggml_backend_cuda_context & 
     const dim3 block_dim(32, nwarps, 1);
     const dim3 grid_dim(total_tiles, 1, 1);
     const uint3 ne01_fd = init_fastdiv_values(Q->ne[1]);
-    const uint3 ne01_fd = init_fastdiv_values(Q->ne[1]);
 
     float scale_val = 1.0f;
     float logit_softcap = 0.0f;
+    float max_bias = 0.0f;
     memcpy(&scale_val,      (const float *) KQV->op_params + 0, sizeof(float));
+    memcpy(&max_bias,       (const float *) KQV->op_params + 1, sizeof(float));
     memcpy(&logit_softcap,  (const float *) KQV->op_params + 2, sizeof(float));
     if (logit_softcap != 0.0f) {
         scale_val /= logit_softcap;
     }
+
+    const uint32_t n_head      = Q->ne[2];
+    const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
+    const float m0 = powf(2.0f, -(max_bias       ) / float(n_head_log2));
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / float(n_head_log2));
 
     constexpr bool V_is_K_view = (DKQ == 576);
 
     const char * K_data = (const char *) K->data;
     const char * V_data = (const char *) V->data;
 
+    // Real mask, sinks and KV_max pointers from tensor inputs
+    const ggml_tensor * mask_t = dst->src[3];
+    const ggml_tensor * sinks_t = dst->src[4];
+    const char * mask_d = mask_t ? (const char *)mask_t->data : nullptr;
+    const char * sinks_d = sinks_t ? (const char *)sinks_t->data : nullptr;
+
+    auto launch = [&](auto kernel_ptr) {
+        CUDA_CHECK(cudaFuncSetAttribute((const void*)kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)nbytes_shared_total));
+        kernel_ptr<<<grid_dim, block_dim, nbytes_shared_total, ctx.stream()>>>(
+            (const char *)Q->data, K_data, V_data,
+            mask_d, sinks_d, (const int *)nullptr,
+            (float *)dst->data, (float2 *)nullptr,
+            scale_val, max_bias, m0, m1, n_head_log2, logit_softcap,
+            Q->ne[0], ne01_fd, Q->ne[2], Q->ne[3],
+            (int32_t)Q->nb[1], (int32_t)Q->nb[2], (int32_t)Q->nb[3],
+            K->ne[0], K->ne[1], K->ne[2], K->ne[3],
+            (int32_t)K->nb[1], (int32_t)K->nb[2], (int64_t)K->nb[3],
+            (int32_t)V->nb[1], (int32_t)V->nb[2], (int64_t)V->nb[3],
+            mask_t ? (int32_t)mask_t->ne[1] : 0,
+            mask_t ? (int32_t)mask_t->ne[2] : 0,
+            mask_t ? (int32_t)mask_t->ne[3] : 0,
+            mask_t ? (int32_t)mask_t->nb[1] : 0,
+            mask_t ? (int32_t)mask_t->nb[2] : 0,
+            mask_t ? (int64_t)mask_t->nb[3] : 0);
+    };
+
     if (logit_softcap == 0.0f) {
-        constexpr bool use_lsc = false;
-        auto kernel = flash_attn_ext_f16_sm70<DKQ, DV, ncols1, ncols2, use_lsc, V_is_K_view>;
-        CUDA_CHECK(cudaFuncSetAttribute((const void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)nbytes_shared_total));
-        kernel<<<grid_dim, block_dim, nbytes_shared_total, ctx.stream()>>>(
-            (const char *)Q->data, K_data, V_data,
-            (const char *)nullptr,
-            (const char *)nullptr,
-            (const int   *)nullptr,
-            (float       *)dst->data,
-            (float2      *)nullptr,
-            scale_val, 0.0f, 0.0f, 0.0f, (uint32_t)0, logit_softcap,
-            Q->ne[0], ne01_fd, Q->ne[2], Q->ne[3],
-            (int32_t)Q->nb[1], (int32_t)Q->nb[2], (int32_t)Q->nb[3],
-            K->ne[0], K->ne[1], K->ne[2], K->ne[3],
-            (int32_t)K->nb[1], (int32_t)K->nb[2], (int64_t)K->nb[3],
-            (int32_t)V->nb[1], (int32_t)V->nb[2], (int64_t)V->nb[3],
-            0, 0, 0, 0, 0, 0, 0);
+        launch(flash_attn_ext_f16_sm70<DKQ, DV, ncols1, ncols2, false, V_is_K_view>);
     } else {
-        constexpr bool use_lsc = true;
-        auto kernel = flash_attn_ext_f16_sm70<DKQ, DV, ncols1, ncols2, use_lsc, V_is_K_view>;
-        CUDA_CHECK(cudaFuncSetAttribute((const void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)nbytes_shared_total));
-        kernel<<<grid_dim, block_dim, nbytes_shared_total, ctx.stream()>>>(
-            (const char *)Q->data, K_data, V_data,
-            (const char *)nullptr,
-            (const char *)nullptr,
-            (const int   *)nullptr,
-            (float       *)dst->data,
-            (float2      *)nullptr,
-            scale_val, 0.0f, 0.0f, 0.0f, (uint32_t)0, logit_softcap,
-            Q->ne[0], ne01_fd, Q->ne[2], Q->ne[3],
-            (int32_t)Q->nb[1], (int32_t)Q->nb[2], (int32_t)Q->nb[3],
-            K->ne[0], K->ne[1], K->ne[2], K->ne[3],
-            (int32_t)K->nb[1], (int32_t)K->nb[2], (int64_t)K->nb[3],
-            (int32_t)V->nb[1], (int32_t)V->nb[2], (int64_t)V->nb[3],
-            0, 0, 0, 0, 0, 0, 0);
+        launch(flash_attn_ext_f16_sm70<DKQ, DV, ncols1, ncols2, true, V_is_K_view>);
     }
 }
 
