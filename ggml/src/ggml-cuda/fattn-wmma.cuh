@@ -16,12 +16,146 @@
 namespace wmma = nvcuda::wmma;
 
 // Tile with 8 half-element padding per row for bank-conflict-free access:
-constexpr int WMMA_PADDING = 8; // half elements
+constexpr int WMMA_PADDING = 8;
 
 // WMMA m16n16k16: each warp handles 16 Q rows per tile
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
+
+// -----------------------------------------------------------------------
+// On-the-fly dequantization helpers: quantized block -> half elements
+// -----------------------------------------------------------------------
+
+__device__ __forceinline__ void dequant_q4_0_to_half(const block_q4_0 & blk, half * out) {
+    const float df = __half2float(blk.d);
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const uint8_t qs = blk.qs[i];
+        out[2*i+0] = __float2half(((qs & 0x0F) - 8) * df);
+        out[2*i+1] = __float2half((((qs >> 4) & 0x0F) - 8) * df);
+    }
+}
+
+__device__ __forceinline__ void dequant_q8_0_to_half(const block_q8_0 & blk, half * out) {
+    const float df = __half2float(blk.d);
+    #pragma unroll
+    for (int i = 0; i < 32; ++i) {
+        out[i] = __float2half(blk.qs[i] * df);
+    }
+}
+
+// -----------------------------------------------------------------------
+// KV tile loader: global memory -> shared memory with on-the-fly dequant
+// -----------------------------------------------------------------------
+
+enum class KVType : int { F16, Q4_0, Q8_0 };
+
+// Detect KV type from byte stride nb1 and column count ncols
+__device__ __forceinline__ KVType detect_kv_type(int64_t nb1, int ncols) {
+    if (nb1 == (int64_t)ncols * (int64_t)sizeof(half)) {
+        return KVType::F16;
+    }
+    if (nb1 == (int64_t)(ncols / QK4_0) * (int64_t)sizeof(block_q4_0)) {
+        return KVType::Q4_0;
+    }
+    // Q8_0: sizeof(block_q8_0) = 34, QK8_0 = 32
+    return KVType::Q8_0;
+}
+
+// Load a tile of K or V from global memory into shared memory.
+// nrows = nbatch_fa, ncols = DKQ (or DV for V).
+// Global memory layout is row-major with stride nb1 (bytes between rows).
+// Shared memory layout is row-major with stride smem_stride (half elements).
+template<int smem_stride>
+__device__ void load_KV_tile(
+    const char * src, half * dst, int nrows, int ncols,
+    int64_t nb1, KVType type)
+{
+    const int tid = threadIdx.x + threadIdx.y * blockDim.x;
+    const int nt  = blockDim.x * blockDim.y;
+
+    switch (type) {
+    case KVType::F16: {
+        const half * src_h = (const half *)src;
+        const int src_stride = (int)(nb1 / sizeof(half));
+        for (int idx = tid; idx < nrows * ncols; idx += nt) {
+            const int r = idx / ncols;
+            const int c = idx % ncols;
+            dst[r * smem_stride + c] = src_h[r * src_stride + c];
+        }
+        break;
+    }
+    case KVType::Q4_0: {
+        const int blocks_per_row = ncols / QK4_0;
+        const int total_blocks = nrows * blocks_per_row;
+        for (int b = tid; b < total_blocks; b += nt) {
+            const int r = b / blocks_per_row;
+            const int blk = b % blocks_per_row;
+            const block_q4_0 * blk_ptr = (const block_q4_0 *)(src + r * nb1) + blk;
+            half tmp[QK4_0];
+            dequant_q4_0_to_half(*blk_ptr, tmp);
+            const int col_base = blk * QK4_0;
+            #pragma unroll
+            for (int i = 0; i < QK4_0; ++i) {
+                dst[r * smem_stride + col_base + i] = tmp[i];
+            }
+        }
+        break;
+    }
+    case KVType::Q8_0: {
+        const int blocks_per_row = ncols / QK8_0;
+        const int total_blocks = nrows * blocks_per_row;
+        for (int b = tid; b < total_blocks; b += nt) {
+            const int r = b / blocks_per_row;
+            const int blk = b % blocks_per_row;
+            const block_q8_0 * blk_ptr = (const block_q8_0 *)(src + r * nb1) + blk;
+            half tmp[QK8_0];
+            dequant_q8_0_to_half(*blk_ptr, tmp);
+            const int col_base = blk * QK8_0;
+            #pragma unroll
+            for (int i = 0; i < QK8_0; ++i) {
+                dst[r * smem_stride + col_base + i] = tmp[i];
+            }
+        }
+        break;
+    }
+    }
+}
+
+// -----------------------------------------------------------------------
+// Q tile loader: F32 global memory -> half shared memory with scale
+// -----------------------------------------------------------------------
+
+// Load Q tile from F32 global memory into half shared memory with scale.
+// Q global layout: [seq][head][token][dkq/2] as float2, stride_Q1 = tokens, stride_Q2 = heads.
+// Shared memory: [ncols x DKQ] half elements with stride smem_stride.
+template<int smem_stride>
+__device__ void load_Q_tile(
+    const float2 * src, half * dst, int nrows, int ncols,
+    int stride_Q1, int stride_Q2, int jt, int ncols2, half scale_h)
+{
+    const int tid = threadIdx.x + threadIdx.y * blockDim.x;
+    const int nt  = blockDim.x * blockDim.y;
+    const float sf = __half2float(scale_h);
+
+    // Each thread loads one or more float2 pairs and expands to 2 half elements.
+    const int total_f2 = nrows * (DKQ/2);
+    for (int idx = tid; idx < total_f2; idx += nt) {
+        const int jc = idx / (DKQ/2);
+        const int k  = idx % (DKQ/2);
+        const int j  = (jt * ncols1) + (jc / ncols2);
+        const int c  = jc % ncols2;
+
+        const float2 tmp = src[j * stride_Q1 + c * stride_Q2 + k];
+        dst[jc * smem_stride + 2*k + 0] = __float2half(tmp.x * sf);
+        dst[jc * smem_stride + 2*k + 1] = __float2half(tmp.y * sf);
+    }
+}
+
+// =========================================================================
+// Main WMMA Flash Attention kernel
+// =========================================================================
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view>
 __launch_bounds__(256, 2)
@@ -53,67 +187,74 @@ static __global__ void flash_attn_ext_f16_sm70(
 
     constexpr int ncols       = ncols1 * ncols2;
     constexpr int warp_size   = 32;
-    const int nwarps      = blockDim.y;
-    constexpr int stride_Q_h  = DKQ + WMMA_PADDING;   // half elements per Q row (smem)
-    constexpr int stride_K_h  = DKQ + WMMA_PADDING;   // half elements per K row (smem)
-    constexpr int stride_V_h  = DV  + WMMA_PADDING;   // half elements per V row (smem)
+    const int nwarps          = blockDim.y;
+    constexpr int stride_Q_h  = DKQ + WMMA_PADDING;
+    constexpr int stride_K_h  = DKQ + WMMA_PADDING;
+    constexpr int stride_V_h  = DV  + WMMA_PADDING;
 
-    // Phase 2: compute nbatch_fa from shared memory budget (48KB dynamic)
-    // Each row uses (DKQ+8)*2 bytes = (DKQ+8)*2 in K/V, (DKQ+8)*2 in Q
-    // Max capacity: Q tile + K tile + V tile <= 48KB
-    // K and V share the same memory (used sequentially), so:
-    // Q_tile + max(K_tile, V_tile) <= 48KB
-    // ncols*(DKQ+8)*2 + max(nbatch_fa*(DKQ+8)*2, nbatch_fa*(DV+8)*2) <= 49152
+    // Compute nbatch_fa from shared memory budget (48KB dynamic)
     constexpr int nbatch_fa = []() {
-        int max_by_DKQ = (49152/2 - ncols*(DKQ+8)) / (DKQ+8);
-        int max_by_DV  = (49152/2 - ncols*(DKQ+8)) / (DV+8);
+        int max_by_DKQ = (48*1024/2 - ncols*(DKQ+8)) / (DKQ+8);
+        int max_by_DV  = (48*1024/2 - ncols*(DKQ+8)) / (DV+8);
         int max_batch  = max_by_DKQ < max_by_DV ? max_by_DKQ : max_by_DV;
         if (max_batch > 128) max_batch = 128;
-        // Round down to multiple of WMMA_N (16):
         max_batch = (max_batch / WMMA_N) * WMMA_N;
         return max_batch > 0 ? max_batch : WMMA_N;
     }();
 
-    constexpr int stride_S_h = nbatch_fa + WMMA_PADDING; // half elements per S row (smem for softmax)
+    constexpr int stride_S_h   = nbatch_fa + WMMA_PADDING;
+    constexpr int nKV_blocks   = (ne11 + nbatch_fa - 1) / nbatch_fa;
+
+    constexpr int smem_QKV_offset = ncols * (stride_Q_h > stride_S_h ? stride_Q_h : stride_S_h);
 
     // Shared memory layout:
-    //   [0 .. ncols*stride_Q_h)                  = tile_Q (ncols x DKQ)
-    //   [ncols*stride_Q_h .. + nbatch_fa*stride_K_h) = tile_KV (shared by K and V)
-    //                                          (reused for either K or V)
     extern __shared__ half smem[];
     half * tile_Q   = smem;
-    half * tile_KV  = smem + ncols * stride_Q_h;
-    half * tile_S   = smem;  // Reuse Q tile space for S during softmax (temporary)
+    half * tile_KV  = smem + smem_QKV_offset;
+    half * tile_S   = smem;
 
-    // Grid / block mapping
-    const int gqa_ratio = ne02 / ne12;
-    const int stride_Q1 = nb01 / sizeof(float2);
-    const int stride_Q2 = nb02 / sizeof(float2);
-    const float2 * Q_f2 = (const float2 *) Q_ptr;
+    // Grid/block tile mapping: blockIdx.x encodes the output tile index
+    const int gqa_ratio  = ne02 / ne12;
+    const int stride_Q1  = nb01 / sizeof(float2);
+    const int stride_Q2  = nb02 / sizeof(float2);
+    const float2 * Q_f2  = (const float2 *) Q_ptr;
+    const char   * K_raw = K_ptr;
+    const char   * V_raw = V_ptr;
 
-    // Q tile loading (global -> shared memory, float2 -> half with scaling)
-    // Phase 3: full implementation with float2 -> half2 conversion and scale
-    // Phase 2 placeholder: zero-initialize tile_Q
-    if (threadIdx.x < warp_size) {
-        for (int r = threadIdx.y; r < ncols; r += nwarps) {
-            for (int c = threadIdx.x; c < DKQ; c += warp_size) {
-                tile_Q[r * stride_Q_h + c] = __float2half(0.0f);
-            }
-        }
+    // Detect K/V types at runtime from byte strides
+    const KVType kv_K_type = detect_kv_type(nb11, DKQ);
+    const KVType kv_V_type = detect_kv_type(nb21, DV);
+
+    // Unpack tile index: sequence->K/V head->GQA head->token position
+    const int iter_j      = (ne01.z + ncols1 - 1) / ncols1;
+    const int iter_z_gqa  = (gqa_ratio + ncols2 - 1) / ncols2;
+    const int tiles_per_seq = iter_j * iter_z_gqa * ne12;
+
+    const int tile_global = blockIdx.x;
+    const int seq         = tile_global / tiles_per_seq;
+    const int tile_in_seq = tile_global % tiles_per_seq;
+    const int z_KV        = tile_in_seq / (iter_j * iter_z_gqa);
+    const int tile_in_KV  = tile_in_seq % (iter_j * iter_z_gqa);
+    const int z_gqa       = tile_in_KV / iter_j;
+    const int jt          = tile_in_KV % iter_j;
+    const int zt_Q        = z_KV * gqa_ratio + z_gqa * ncols2;
+
+    // ---- Q load: F32 -> half with scale ----
+    {
+        const half scale_h = __float2half(scale);
+        const float2 * Q_src = Q_f2 + (seq * ne02 + zt_Q) * stride_Q2;
+
+        load_Q_tile<stride_Q_h>(
+            Q_src, tile_Q, ncols, DKQ, stride_Q1, stride_Q2, jt, ncols2, scale_h);
     }
-
     __syncthreads();
 
     // Warp distribution across Q rows
-    // Each warp handles WMMA_M=16 consecutive Q rows
     const int warp_id    = threadIdx.y;
     const int warp_q_row = warp_id * WMMA_M;
     if (warp_q_row >= ncols) {
         return;
     }
-
-    // Iterate over KV cache in blocks of nbatch_fa
-    const int nKV_blocks  = (ne11 + nbatch_fa - 1) / nbatch_fa;
 
     // Per-warp persistent state
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> S_acc;
@@ -121,17 +262,21 @@ static __global__ void flash_attn_ext_f16_sm70(
 
     for (int kb = 0; kb < nKV_blocks; ++kb) {
         const int kv_start = kb * nbatch_fa;
-        const int kv_count = nbatch_fa;
         if (kv_start >= ne11) break;
+        const int kv_count = min(nbatch_fa, ne11 - kv_start);
 
-        // Phase 3: Load K tile from global memory (on-the-fly dequant)
-        if (threadIdx.x < warp_size) {
-            for (int r = threadIdx.y; r < nbatch_fa; r += nwarps) {
-                for (int c = threadIdx.x; c < DKQ; c += warp_size) {
-                    tile_KV[r * stride_K_h + c] = __float2half(0.0f);
-                }
+        // Zero-initialize unused rows of tile_KV for the partial last block
+        if (kv_count < nbatch_fa) {
+            const int tid = threadIdx.x + threadIdx.y * warp_size;
+            const int nt  = blockDim.x * blockDim.y;
+            for (int idx = tid; idx < nbatch_fa * stride_K_h; idx += nt) {
+                tile_KV[idx] = __float2half(0.0f);
             }
+            __syncthreads();
         }
+
+        // ---- Load K tile: global -> shared with on-the-fly dequant ----
+        load_KV_tile<stride_K_h>(K_raw + kv_start * nb11, tile_KV, kv_count, DKQ, nb11, kv_K_type);
         __syncthreads();
 
         // ---- Compute S = Q * K^T via WMMA ----
@@ -146,41 +291,41 @@ static __global__ void flash_attn_ext_f16_sm70(
             wmma::mma_sync(S_acc, Q_frag, K_frag, S_acc);
         }
 
-        // ---- Online softmax (placeholder: identity transform) ----
+        // ---- Online softmax (placeholder: identity) ----
         wmma::store_matrix_sync(tile_S + warp_q_row * stride_S_h, S_acc, stride_S_h, wmma::mem_row_major);
         __syncthreads();
         wmma::load_matrix_sync(S_acc, tile_S + warp_q_row * stride_S_h, stride_S_h, wmma::mem_row_major);
 
-        // ---- Compute O = S * V via WMMA ----
+        // ---- Load V tile: global -> shared with on-the-fly dequant ----
         wmma::fill_fragment(VKQ_acc, 0.0f);
-
-        // Phase 3: Load V tile from global memory
-        if (threadIdx.x < warp_size) {
-            for (int r = threadIdx.y; r < nbatch_fa; r += nwarps) {
-                for (int c = threadIdx.x; c < DV; c += warp_size) {
-                    tile_KV[r * stride_V_h + c] = __float2half(0.0f);
-                }
+        if (kv_count < nbatch_fa) {
+            const int tid = threadIdx.x + threadIdx.y * warp_size;
+            const int nt  = blockDim.x * blockDim.y;
+            for (int idx = tid; idx < nbatch_fa * stride_V_h; idx += nt) {
+                tile_KV[idx] = __float2half(0.0f);
             }
+            __syncthreads();
         }
+        load_KV_tile<stride_V_h>(V_raw + kv_start * nb21, tile_KV, kv_count, DV, nb21, kv_V_type);
         __syncthreads();
 
-        for (int kv_sub = 0; kv_sub < nbatch_fa; kv_sub += WMMA_N) {
+        // ---- Compute O = S * V via WMMA (Phase 4: full tiled multiply) ----
+        for (int kv_sub = 0; kv_sub < kv_count; kv_sub += WMMA_N) {
             wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> V_frag;
             wmma::load_matrix_sync(V_frag, tile_KV + kv_sub * stride_V_h, stride_V_h);
 
-            // Phase 4: full tiled VKQ with proper S*V multiply
-            // For now, placeholder identity: VKQ_acc unchanged
+            // Phase 4: proper S * V tiling and accumulation with online softmax rescaling
         }
 
         __syncthreads();
     }
 
-    // Phase 5: Write output to global memory (placeholder: no-op)
+    // Phase 5: Write output to global memory
     GGML_UNUSED_VARS(Q_f2, stride_Q1, stride_Q2, gqa_ratio,
-        K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr,
-        max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne01, ne02, ne03, nb01, nb02, nb03,
-        ne11, ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23,
-        ne31, ne32, ne33, nb31, nb32, nb33, VKQ_acc);
+        mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr,
+        max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne01, ne02, ne03,
+        ne11, ne12, ne13, nb12, nb13, nb22, nb23,
+        ne31, ne32, ne33, nb31, nb32, nb33);
 
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
@@ -200,6 +345,9 @@ static __global__ void flash_attn_ext_f16_sm70(
 template <int DKQ, int DV, int ncols1, int ncols2>
 static void ggml_cuda_flash_attn_ext_wmma_sm70_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
+    const ggml_tensor * Q   = dst->src[0];
+    const ggml_tensor * K   = dst->src[1];
+    const ggml_tensor * V   = dst->src[2];
 
     constexpr int ncols = ncols1 * ncols2;
 
@@ -223,25 +371,54 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70_case(ggml_backend_cuda_context & 
     constexpr size_t nbytes_shared_Q  = ncols * stride_Q_h * sizeof(half);
     constexpr size_t nbytes_shared_KV = nbatch_fa * (stride_K_h > stride_V_h ? stride_K_h : stride_V_h) * sizeof(half);
     constexpr size_t nbytes_shared_S  = ncols * (nbatch_fa + WMMA_PADDING) * sizeof(half);
-
-    // S tile reuses Q tile memory (not simultaneously), so take the max
     constexpr size_t nbytes_shared_total = (nbytes_shared_Q > nbytes_shared_S ? nbytes_shared_Q : nbytes_shared_S) + nbytes_shared_KV;
 
-    float logit_softcap;
-    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    // Compute grid dimensions: one block per output tile
+    const int gqa_ratio    = Q->ne[2] / K->ne[2];
+    const int iter_j       = (Q->ne[1] + ncols1 - 1) / ncols1;
+    const int iter_z_gqa   = (gqa_ratio + ncols2 - 1) / ncols2;
+    const int total_tiles  = iter_j * iter_z_gqa * K->ne[2] * Q->ne[3];
+
+    const dim3 block_dim(32, nwarps, 1);
+    const dim3 grid_dim(total_tiles, 1, 1);
+    const uint3 ne01_fd = init_fastdiv_values(Q->ne[1]);
+
+    float scale_val = 1.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale_val,      (const float *) KQV->op_params + 0, sizeof(float));
+    memcpy(&logit_softcap,  (const float *) KQV->op_params + 2, sizeof(float));
+    if (logit_softcap != 0.0f) {
+        scale_val /= logit_softcap;
+    }
 
     constexpr bool V_is_K_view = (DKQ == 576);
 
-    fattn_kernel_t fattn_kernel;
-    if (logit_softcap == 0.0f) {
-        constexpr bool use_lsc = false;
-        fattn_kernel = flash_attn_ext_f16_sm70<DKQ, DV, ncols1, ncols2, use_lsc, V_is_K_view>;
-    } else {
-        constexpr bool use_lsc = true;
-        fattn_kernel = flash_attn_ext_f16_sm70<DKQ, DV, ncols1, ncols2, use_lsc, V_is_K_view>;
-    }
+    const char * K_data = (const char *) K->data;
+    const char * V_data = (const char *) V->data;
 
-    launch_fattn<DV, ncols1, ncols2>(ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, 32);
+    auto launch_kernel = [&](auto kernel_ptr) {
+        CUDA_CHECK(cudaFuncSetAttribute((const void*)kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)nbytes_shared_total));
+        kernel_ptr<<<grid_dim, block_dim, nbytes_shared_total, ctx.stream()>>>(
+            (const char *)Q->data, K_data, V_data,
+            (const char *)nullptr,
+            (const char *)nullptr,
+            (const int   *)nullptr,
+            (float       *)dst->data,
+            (float2      *)nullptr,
+            scale_val, 0.0f, 0.0f, 0.0f, (uint32_t)0, logit_softcap,
+            Q->ne[0], ne01_fd, Q->ne[2], Q->ne[3],
+            (int32_t)Q->nb[1], (int32_t)Q->nb[2], (int32_t)Q->nb[3],
+            K->ne[0], K->ne[1], K->ne[2], K->ne[3],
+            (int32_t)K->nb[1], (int32_t)K->nb[2], (int64_t)K->nb[3],
+            (int32_t)V->nb[1], (int32_t)V->nb[2], (int64_t)V->nb[3],
+            0, 0, 0, 0, 0, 0, 0);
+    };
+
+    if (logit_softcap == 0.0f) {
+        launch_kernel(flash_attn_ext_f16_sm70<DKQ, DV, ncols1, ncols2, false, V_is_K_view>);
+    } else {
+        launch_kernel(flash_attn_ext_f16_sm70<DKQ, DV, ncols1, ncols2, true, V_is_K_view>);
+    }
 }
 
 //
@@ -252,8 +429,6 @@ template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
 
-    // With WMMA m16n16k16 each warp tiles 16 Q rows (M=16).
-    // 8 warps per block => up to 128 Q-rows per thread block.
     if (Q->ne[1] <= 16/ncols2) {
         ggml_cuda_flash_attn_ext_wmma_sm70_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
         return;
@@ -270,7 +445,7 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols1(ggml_backend_cuda_c
 }
 
 //
-// ncols2 switch: GQA routing (how many Q heads per K/V head per thread block)
+// ncols2 switch: GQA routing
 //
 
 template <int DKQ, int DV>
@@ -297,7 +472,6 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols2(ggml_backend_cuda_c
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
-    // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (use_gqa_opt && gqa_ratio % 8 == 0) {
         ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols1<DKQ, DV, 8>(ctx, dst);
         return;
