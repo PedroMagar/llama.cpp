@@ -1895,7 +1895,7 @@ static __global__ void flash_attn_ext_f16(
 #elif __CUDA_ARCH__ >= 700
     //
     // Volta (sm_70): CUTLASS 2.x-based flash attention kernel
-    // TODO: implement in Phase 2+
+    // TODO: implement in Phase 3+
     //
     NO_DEVICE_CODE;
     return;
