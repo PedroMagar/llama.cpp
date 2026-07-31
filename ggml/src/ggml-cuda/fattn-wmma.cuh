@@ -53,14 +53,13 @@ enum class KVType : int { F16, Q4_0, Q8_0 };
 
 // Detect KV type from byte stride nb1 and column count ncols
 __device__ __forceinline__ KVType detect_kv_type(int64_t nb1, int ncols) {
-    if (nb1 == (int64_t)ncols * (int64_t)sizeof(half)) {
-        return KVType::F16;
+    if (nb1 >= (int64_t)(ncols / QK8_0) * (int64_t)sizeof(block_q8_0)) {
+        return KVType::Q8_0;
     }
-    if (nb1 == (int64_t)(ncols / QK4_0) * (int64_t)sizeof(block_q4_0)) {
+    if (nb1 >= (int64_t)(ncols / QK4_0) * (int64_t)sizeof(block_q4_0)) {
         return KVType::Q4_0;
     }
-    // Q8_0: sizeof(block_q8_0) = 34, QK8_0 = 32
-    return KVType::Q8_0;
+    return KVType::F16;
 }
 
 // Load a tile of K or V from global memory into shared memory.
@@ -316,6 +315,13 @@ static __global__ void flash_attn_ext_f16_sm70(
                 wmma::mma_sync(S_frag, Q_frag, K_frag, S_frag);
             }
 
+            if (use_logit_softcap) {
+                #pragma unroll
+                for (int l = 0; l < decltype(S_frag)::ne; ++l) {
+                    S_frag.x[l] = logit_softcap * tanhf(S_frag.x[l] / logit_softcap);
+                }
+            }
+
             wmma::store_matrix_sync(
                 tile_S + warp_q_row * stride_S_h + kv_sub,
                 S_frag, stride_S_h, wmma::mem_row_major);
@@ -450,6 +456,7 @@ static __global__ void flash_attn_ext_f16_sm70(
 
             // Each thread writes one float2 (2 consecutive DV elements)
             const int total_pairs = WMMA_M * (WMMA_N / 2);
+            #pragma unroll
             for (int idx = tid; idx < total_pairs; idx += nt) {
                 const int r      = idx / (WMMA_N / 2);
                 const int c_pair = idx % (WMMA_N / 2);
@@ -553,9 +560,11 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70_case(ggml_backend_cuda_context & 
     const char * K_data = (const char *) K->data;
     const char * V_data = (const char *) V->data;
 
-    auto launch_kernel = [&](auto kernel_ptr) {
-        CUDA_CHECK(cudaFuncSetAttribute((const void*)kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)nbytes_shared_total));
-        kernel_ptr<<<grid_dim, block_dim, nbytes_shared_total, ctx.stream()>>>(
+    if (logit_softcap == 0.0f) {
+        constexpr bool use_lsc = false;
+        auto kernel = flash_attn_ext_f16_sm70<DKQ, DV, ncols1, ncols2, use_lsc, V_is_K_view>;
+        CUDA_CHECK(cudaFuncSetAttribute((const void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)nbytes_shared_total));
+        kernel<<<grid_dim, block_dim, nbytes_shared_total, ctx.stream()>>>(
             (const char *)Q->data, K_data, V_data,
             (const char *)nullptr,
             (const char *)nullptr,
@@ -569,12 +578,24 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70_case(ggml_backend_cuda_context & 
             (int32_t)K->nb[1], (int32_t)K->nb[2], (int64_t)K->nb[3],
             (int32_t)V->nb[1], (int32_t)V->nb[2], (int64_t)V->nb[3],
             0, 0, 0, 0, 0, 0, 0);
-    };
-
-    if (logit_softcap == 0.0f) {
-        launch_kernel(flash_attn_ext_f16_sm70<DKQ, DV, ncols1, ncols2, false, V_is_K_view>);
     } else {
-        launch_kernel(flash_attn_ext_f16_sm70<DKQ, DV, ncols1, ncols2, true, V_is_K_view>);
+        constexpr bool use_lsc = true;
+        auto kernel = flash_attn_ext_f16_sm70<DKQ, DV, ncols1, ncols2, use_lsc, V_is_K_view>;
+        CUDA_CHECK(cudaFuncSetAttribute((const void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)nbytes_shared_total));
+        kernel<<<grid_dim, block_dim, nbytes_shared_total, ctx.stream()>>>(
+            (const char *)Q->data, K_data, V_data,
+            (const char *)nullptr,
+            (const char *)nullptr,
+            (const int   *)nullptr,
+            (float       *)dst->data,
+            (float2      *)nullptr,
+            scale_val, 0.0f, 0.0f, 0.0f, (uint32_t)0, logit_softcap,
+            Q->ne[0], ne01_fd, Q->ne[2], Q->ne[3],
+            (int32_t)Q->nb[1], (int32_t)Q->nb[2], (int32_t)Q->nb[3],
+            K->ne[0], K->ne[1], K->ne[2], K->ne[3],
+            (int32_t)K->nb[1], (int32_t)K->nb[2], (int64_t)K->nb[3],
+            (int32_t)V->nb[1], (int32_t)V->nb[2], (int64_t)V->nb[3],
+            0, 0, 0, 0, 0, 0, 0);
     }
 }
 
