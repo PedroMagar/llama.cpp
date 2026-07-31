@@ -316,32 +316,44 @@ static __global__ void flash_attn_ext_f16_sm70(
                 wmma::mma_sync(S_frag, Q_frag, K_frag, S_frag);
             }
 
-            // Store S to tile_S for softmax
             wmma::store_matrix_sync(
                 tile_S + warp_q_row * stride_S_h + kv_sub,
                 S_frag, stride_S_h, wmma::mem_row_major);
             __syncthreads();
 
-            // Online softmax per Q row
+            // Step 1: compute new max for all 16 Q rows (batched)
+            float new_max_vals[WMMA_M];
+            #pragma unroll
             for (int r = 0; r < WMMA_M; ++r) {
-                const int row_smem = (warp_q_row + r) * stride_S_h + kv_sub;
-
                 float local_max = -FLT_MAX;
                 #pragma unroll
                 for (int c = threadIdx.x; c < WMMA_N && c < kv_sub_count; c += warp_size) {
-                    local_max = fmaxf(local_max, __half2float(tile_S[row_smem + c]));
+                    local_max = fmaxf(local_max, __half2float(tile_S[(warp_q_row + r) * stride_S_h + kv_sub + c]));
                 }
                 #pragma unroll
                 for (int offset = 16; offset > 0; offset >>= 1) {
                     local_max = fmaxf(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, offset, warp_size));
                 }
+                new_max_vals[r] = fmaxf(row_max[r], local_max);
+            }
 
-                const float old_max = row_max[r];
-                const float new_max = fmaxf(old_max, local_max);
-                const float max_diff = old_max - new_max;
-                const float scale = expf(max_diff);
+            // Step 2: batch rescale VKQ accumulators (once per tile, not per row)
+            {
+                bool need_rescale = false;
+                float scale_vals[WMMA_M];
+                #pragma unroll
+                for (int r = 0; r < WMMA_M; ++r) {
+                    float max_diff = row_max[r] - new_max_vals[r];
+                    float scale = expf(max_diff);
+                    *((uint32_t *)&scale) *= max_diff >= SOFTMAX_FTZ_THRESHOLD;
+                    scale_vals[r] = scale;
+                    if (row_max[r] < new_max_vals[r]) {
+                        need_rescale = true;
+                    }
+                }
 
-                if (max_diff < 0.0f && DV_tiles > 0) {
+                if (need_rescale) {
+                    #pragma unroll
                     for (int t = 0; t < DV_tiles; ++t) {
                         wmma::store_matrix_sync(
                             (half *)tile_rescale, VKQ_acc[t], WMMA_N, wmma::mem_row_major);
@@ -349,8 +361,10 @@ static __global__ void flash_attn_ext_f16_sm70(
 
                         if (threadIdx.x < WMMA_N) {
                             #pragma unroll
-                            for (int c = 0; c < WMMA_N; ++c) {
-                                tile_rescale[(r % WMMA_N) * WMMA_N + c] *= scale;
+                            for (int r = 0; r < WMMA_M; ++r) {
+                                if (row_max[r] < new_max_vals[r]) {
+                                    tile_rescale[r * WMMA_N + threadIdx.x] *= scale_vals[r];
+                                }
                             }
                         }
                         __syncthreads();
@@ -359,20 +373,27 @@ static __global__ void flash_attn_ext_f16_sm70(
                             VKQ_acc[t], (half *)tile_rescale, WMMA_N, wmma::mem_row_major);
                     }
                 }
-                row_max[r] = new_max;
+            }
+
+            // Step 3: compute exp, update state, write P back
+            #pragma unroll
+            for (int r = 0; r < WMMA_M; ++r) {
+                row_max[r] = new_max_vals[r];
 
                 float local_sum = 0.0f;
                 #pragma unroll
                 for (int c = threadIdx.x; c < WMMA_N && c < kv_sub_count; c += warp_size) {
-                    const float val = expf(__half2float(tile_S[row_smem + c]) - new_max);
-                    tile_S[row_smem + c] = __float2half(val);
+                    const int offset = (warp_q_row + r) * stride_S_h + kv_sub + c;
+                    const float diff = __half2float(tile_S[offset]) - new_max_vals[r];
+                    const float val = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : expf(diff);
+                    tile_S[offset] = __float2half(val);
                     local_sum += val;
                 }
                 #pragma unroll
                 for (int offset = 16; offset > 0; offset >>= 1) {
                     local_sum += __shfl_xor_sync(0xFFFFFFFF, local_sum, offset, warp_size);
                 }
-                row_sum[r] = row_sum[r] * scale + local_sum;
+                row_sum[r] = row_sum[r] * scale_vals[r] + local_sum;
             }
             __syncthreads();
         }
@@ -390,7 +411,9 @@ static __global__ void flash_attn_ext_f16_sm70(
         __syncthreads();
 
         // ---- Phase B: Compute O = P * V via WMMA ----
+        #pragma unroll
         for (int kv_sub = 0; kv_sub < kv_count; kv_sub += WMMA_N) {
+            #pragma unroll
             for (int t = 0; t < DV_tiles; ++t) {
                 wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> P_frag;
                 wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> V_frag;
@@ -414,6 +437,7 @@ static __global__ void flash_attn_ext_f16_sm70(
     {
         float2 * dst_f2 = ((float2 *)dst_ptr) + (seq * ne01.z * ne02 + zt_Q) * (DV/2);
 
+        #pragma unroll
         for (int t = 0; t < DV_tiles; ++t) {
             // Store VKQ tile to rescale buffer
             wmma::store_matrix_sync(
