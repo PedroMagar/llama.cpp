@@ -152,6 +152,27 @@ __device__ void load_Q_tile(
     }
 }
 
+// -----------------------------------------------------------------------
+// Mask tile loader: global memory -> shared memory
+// -----------------------------------------------------------------------
+
+__device__ __forceinline__ void load_mask_tile(
+    const half * mask_h, half * tile_mask,
+    int stride_mask, int kv_count, int j0, int ncols1_val, int nbatch_fa_val)
+{
+    const int warp_size = 32;
+    const int tid = threadIdx.x + threadIdx.y * warp_size;
+    const int nt  = blockDim.x * blockDim.y;
+
+    const int total_half = ncols1_val * kv_count;
+    for (int idx = tid; idx < total_half; idx += nt) {
+        const int r = idx / kv_count;
+        const int c = idx % kv_count;
+        const int j_vram = j0 + r;
+        tile_mask[r * (nbatch_fa_val + 8) + c] = mask_h[j_vram * stride_mask + c];
+    }
+}
+
 // =========================================================================
 // Main WMMA Flash Attention kernel
 // =========================================================================
@@ -203,16 +224,21 @@ static __global__ void flash_attn_ext_f16_sm70(
 
     constexpr int stride_S_h   = nbatch_fa + WMMA_PADDING;
     constexpr int nKV_blocks   = (ne11 + nbatch_fa - 1) / nbatch_fa;
+    const int iter_k           = nKV_blocks;
 
     constexpr int smem_QKV_offset = ncols * (stride_Q_h > stride_S_h ? stride_Q_h : stride_S_h);
+    constexpr int smem_rescale_offset = smem_QKV_offset + nbatch_fa * (stride_K_h > stride_V_h ? stride_K_h : stride_V_h);
+    constexpr int smem_mask_offset = smem_rescale_offset + (WMMA_M * WMMA_N * sizeof(float) + sizeof(half) - 1) / sizeof(half);
 
     // Shared memory layout:
     extern __shared__ half smem[];
     half * tile_Q   = smem;
     half * tile_KV  = smem + smem_QKV_offset;
     half * tile_S   = smem;
+    float * tile_rescale = (float *)(smem + smem_rescale_offset);
+    half * tile_mask     = smem + smem_mask_offset;
 
-    // Grid/block tile mapping: blockIdx.x encodes the output tile index
+    // Stream-K tile iteration: distribute contiguous KV/sequence work across blocks
     const int gqa_ratio  = ne02 / ne12;
     const int stride_Q1  = nb01 / sizeof(float2);
     const int stride_Q2  = nb02 / sizeof(float2);
@@ -224,268 +250,314 @@ static __global__ void flash_attn_ext_f16_sm70(
     const KVType kv_K_type = detect_kv_type(nb11, DKQ);
     const KVType kv_V_type = detect_kv_type(nb21, DV);
 
-    // Unpack tile index: sequence->K/V head->GQA head->token position
+    // Stream-K iteration counts
     const int iter_j      = (ne01.z + ncols1 - 1) / ncols1;
     const int iter_z_gqa  = (gqa_ratio + ncols2 - 1) / ncols2;
+    const int total_tiles  = iter_j * iter_z_gqa * ne12 * ne03;
     const int tiles_per_seq = iter_j * iter_z_gqa * ne12;
 
-    const int tile_global = blockIdx.x;
-    const int seq         = tile_global / tiles_per_seq;
-    const int tile_in_seq = tile_global % tiles_per_seq;
-    const int z_KV        = tile_in_seq / (iter_j * iter_z_gqa);
-    const int tile_in_KV  = tile_in_seq % (iter_j * iter_z_gqa);
-    const int z_gqa       = tile_in_KV / iter_j;
-    const int jt          = tile_in_KV % iter_j;
-    const int zt_Q        = z_KV * gqa_ratio + z_gqa * ncols2;
-
-    // ---- Q load: F32 -> half with scale ----
-    {
-        const half scale_h = __float2half(scale);
-        const float2 * Q_src = Q_f2 + (seq * ne02 + zt_Q) * stride_Q2;
-
-        load_Q_tile<stride_Q_h>(
-            Q_src, tile_Q, ncols, DKQ, stride_Q1, stride_Q2, jt, ncols2, scale_h);
-    }
-    __syncthreads();
+    // Stream-K: distribute continuous tile range across blocks
+    int kbc      = int64_t(blockIdx.x + 0) * total_tiles / gridDim.x;
+    int kbc_stop = int64_t(blockIdx.x + 1) * total_tiles / gridDim.x;
 
     // Warp distribution across Q rows
     const int warp_id    = threadIdx.y;
     const int warp_q_row = warp_id * WMMA_M;
-    if (warp_q_row >= ncols) {
-        return;
-    }
+    const int nwarps_active = ncols / WMMA_M;
 
-    // Number of DV tiles per VKQ accumulator
-    constexpr int DV_tiles = DV / WMMA_K;
-
-    // Per-warp online softmax state
+    // Per-warp online softmax state (persistent across stream-K iterations)
     float row_max[WMMA_M];
     float row_sum[WMMA_M];
-
-    // VKQ accumulator: one WMMA fragment per DV tile
+    constexpr int DV_tiles = DV / WMMA_K;
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tiles];
 
-    // Online softmax rescaling buffer (16x16 float = 1KB)
-    // Located at the end of tile_KV, reusing shared memory after V is loaded
+    // Shared memory: rescale buffer at end of tile_KV
     float * tile_rescale = (float *)(tile_KV + nbatch_fa * (stride_K_h > stride_V_h ? stride_K_h : stride_V_h));
 
-    // Initialize online softmax state
-    #pragma unroll
-    for (int i = 0; i < WMMA_M; ++i) {
-        row_max[i] = -FLT_MAX;
-        row_sum[i] = 0.0f;
-    }
-    #pragma unroll
-    for (int t = 0; t < DV_tiles; ++t) {
-        wmma::fill_fragment(VKQ_acc[t], 0.0f);
-    }
+    while (kbc < kbc_stop) {
+        // Unpack tile index from kbc
+        int seq         = kbc / tiles_per_seq;
+        int tile_in_seq = kbc % tiles_per_seq;
+        int z_KV        = tile_in_seq / (iter_j * iter_z_gqa);
+        int tile_in_KV  = tile_in_seq % (iter_j * iter_z_gqa);
+        int z_gqa       = tile_in_KV / iter_j;
+        int jt          = tile_in_KV % iter_j;
+        int zt_Q        = z_KV * gqa_ratio + z_gqa * ncols2;
 
-    for (int kb = 0; kb < nKV_blocks; ++kb) {
-        const int kv_start = kb * nbatch_fa;
-        if (kv_start >= ne11) break;
-        const int kv_count = min(nbatch_fa, ne11 - kv_start);
+        // KV iteration range for this invocation
+        const int kv_start_offset = kbc % total_tiles < total_tiles ? 0 : 0; // always 0 per tile
+        int kb0_start = 0;
+        int kb0_stop  = iter_k;
 
-        // Zero-initialize unused rows of tile_KV for the partial last block
-        if (kv_count < nbatch_fa) {
-            const int tid = threadIdx.x + threadIdx.y * warp_size;
-            const int nt  = blockDim.x * blockDim.y;
-            for (int idx = tid; idx < nbatch_fa * stride_K_h; idx += nt) {
-                tile_KV[idx] = __float2half(0.0f);
-            }
-            __syncthreads();
+// ALiBi slope per tile
+        float slope = 1.0f;
+        if (ncols2 == 1 && max_bias > 0.0f) {
+            slope = get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1);
         }
 
-        // ---- Phase A: Load K tile ----
-        load_KV_tile<stride_K_h>(K_raw + kv_start * nb11, tile_KV, kv_count, DKQ, nb11, kv_K_type);
-        __syncthreads();
-
-        // ---- Phase A: Compute S = Q * K^T and online softmax, store P to tile_S ----
-        for (int kv_sub = 0; kv_sub < kv_count; kv_sub += WMMA_N) {
-            const int kv_sub_count = min(WMMA_N, kv_count - kv_sub);
-
-            wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> S_frag;
-            wmma::fill_fragment(S_frag, 0.0f);
-
-            for (int dkq = 0; dkq < DKQ; dkq += WMMA_K) {
-                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> Q_frag;
-                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> K_frag;
-
-                wmma::load_matrix_sync(Q_frag, tile_Q + warp_q_row * stride_Q_h + dkq, stride_Q_h);
-                wmma::load_matrix_sync(K_frag, tile_KV + kv_sub * stride_K_h + dkq, stride_K_h);
-                wmma::mma_sync(S_frag, Q_frag, K_frag, S_frag);
-            }
-
-            if (use_logit_softcap) {
+        // Skip warps that have no Q rows to process
+        if (warp_q_row < ncols) {
+            // Initialize softmax state for this tile
+            // (only if entering a new tile)
+            if (kb0_start == 0) {
                 #pragma unroll
-                for (int l = 0; l < decltype(S_frag)::ne; ++l) {
-                    S_frag.x[l] = logit_softcap * tanhf(S_frag.x[l] / logit_softcap);
-                }
-            }
-
-            wmma::store_matrix_sync(
-                tile_S + warp_q_row * stride_S_h + kv_sub,
-                S_frag, stride_S_h, wmma::mem_row_major);
-            __syncthreads();
-
-            // Step 1: compute new max for all 16 Q rows (batched)
-            float new_max_vals[WMMA_M];
-            #pragma unroll
-            for (int r = 0; r < WMMA_M; ++r) {
-                float local_max = -FLT_MAX;
-                #pragma unroll
-                for (int c = threadIdx.x; c < WMMA_N && c < kv_sub_count; c += warp_size) {
-                    local_max = fmaxf(local_max, __half2float(tile_S[(warp_q_row + r) * stride_S_h + kv_sub + c]));
+                for (int i = 0; i < WMMA_M; ++i) {
+                    row_max[i] = -FLT_MAX;
+                    row_sum[i] = 0.0f;
                 }
                 #pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1) {
-                    local_max = fmaxf(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, offset, warp_size));
+                for (int t = 0; t < DV_tiles; ++t) {
+                    wmma::fill_fragment(VKQ_acc[t], 0.0f);
                 }
-                new_max_vals[r] = fmaxf(row_max[r], local_max);
-            }
 
-            // Step 2: batch rescale VKQ accumulators (once per tile, not per row)
-            {
-                bool need_rescale = false;
-                float scale_vals[WMMA_M];
-                #pragma unroll
-                for (int r = 0; r < WMMA_M; ++r) {
-                    float max_diff = row_max[r] - new_max_vals[r];
-                    float scale = expf(max_diff);
-                    *((uint32_t *)&scale) *= max_diff >= SOFTMAX_FTZ_THRESHOLD;
-                    scale_vals[r] = scale;
-                    if (row_max[r] < new_max_vals[r]) {
-                        need_rescale = true;
+                // ---- Q load: F32 -> half with scale ----
+                const half scale_h = __float2half(scale);
+                const float2 * Q_src = Q_f2 + (seq * ne02 + zt_Q) * stride_Q2;
+                load_Q_tile<stride_Q_h>(Q_src, tile_Q, ncols, DKQ, stride_Q1, stride_Q2, jt, ncols2, scale_h);
+                __syncthreads();
+
+                // ---- Attention sinks ----
+                if (sinks_ptr) {
+                    const float * sinks_f = (const float *)sinks_ptr + zt_Q;
+                    #pragma unroll
+                    for (int r = 0; r < WMMA_M; ++r) {
+                        const int head = (warp_q_row + r) % ncols2;
+                        const float sink = sinks_f[head];
+                        const float new_max = fmaxf(row_max[r], sink);
+                        const float max_diff = row_max[r] - new_max;
+                        // row_max[r] was -FLT_MAX, so new_max = sink, max_diff below threshold
+                        float scale = expf(max_diff);
+                        *((uint32_t *)&scale) *= max_diff >= SOFTMAX_FTZ_THRESHOLD;
+                        row_max[r] = new_max;
+                        row_sum[r] = row_sum[r] * scale + expf(sink - new_max);
                     }
                 }
+            }
 
-                if (need_rescale) {
+            // ---- KV iteration loop ----
+            for (int kb = kb0_start; kb < kb0_stop; ++kb) {
+                const int kv_start = kb * nbatch_fa;
+                if (kv_start >= ne11) break;
+                const int kv_count = min(nbatch_fa, ne11 - kv_start);
+
+                if (kv_count < nbatch_fa) {
+                    const int tid = threadIdx.x + threadIdx.y * warp_size;
+                    const int nt  = blockDim.x * blockDim.y;
+                    for (int idx = tid; idx < nbatch_fa * stride_K_h; idx += nt) {
+                        tile_KV[idx] = __float2half(0.0f);
+                    }
+                    __syncthreads();
+                }
+
+                // ---- Phase A: Load K tile ----
+                load_KV_tile<stride_K_h>(K_raw + kv_start * nb11, tile_KV, kv_count, DKQ, nb11, kv_K_type);
+                __syncthreads();
+
+                // Load mask for this KV block if present
+                if (mask_ptr) {
+                    const half * mask_h = (const half *)mask_ptr + (seq % ne33) * (nb33 / sizeof(half));
+                    const int stride_m = nb31 / sizeof(half);
+                    load_mask_tile(mask_h + kv_start, tile_mask,
+                        stride_m, kv_count, jt * ncols1, ncols1, nbatch_fa);
+                    __syncthreads();
+                }
+
+                // ---- Phase A: S = Q * K^T + online softmax ----
+                for (int kv_sub = 0; kv_sub < kv_count; kv_sub += WMMA_N) {
+                    const int kv_sub_count = min(WMMA_N, kv_count - kv_sub);
+
+                    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> S_frag;
+                    wmma::fill_fragment(S_frag, 0.0f);
+
+                    for (int dkq = 0; dkq < DKQ; dkq += WMMA_K) {
+                        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> Q_frag;
+                        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> K_frag;
+
+                        wmma::load_matrix_sync(Q_frag, tile_Q + warp_q_row * stride_Q_h + dkq, stride_Q_h);
+                        wmma::load_matrix_sync(K_frag, tile_KV + kv_sub * stride_K_h + dkq, stride_K_h);
+                        wmma::mma_sync(S_frag, Q_frag, K_frag, S_frag);
+                    }
+
+                    if (use_logit_softcap) {
+                        #pragma unroll
+                        for (int l = 0; l < decltype(S_frag)::ne; ++l) {
+                            S_frag.x[l] = logit_softcap * tanhf(S_frag.x[l] / logit_softcap);
+                        }
+                    }
+
+                    wmma::store_matrix_sync(
+                        tile_S + warp_q_row * stride_S_h + kv_sub,
+                        S_frag, stride_S_h, wmma::mem_row_major);
+                    __syncthreads();
+
+                    // Online softmax
+                    float new_max_vals[WMMA_M];
                     #pragma unroll
-                    for (int t = 0; t < DV_tiles; ++t) {
-                        wmma::store_matrix_sync(
-                            (half *)tile_rescale, VKQ_acc[t], WMMA_N, wmma::mem_row_major);
-                        __syncthreads();
+                    for (int r = 0; r < WMMA_M; ++r) {
+                        float local_max = -FLT_MAX;
+                        #pragma unroll
+                        for (int c = threadIdx.x; c < WMMA_N && c < kv_sub_count; c += warp_size) {
+                            local_max = fmaxf(local_max, __half2float(tile_S[(warp_q_row + r) * stride_S_h + kv_sub + c]));
+                        }
+                        #pragma unroll
+                        for (int offset = 16; offset > 0; offset >>= 1) {
+                            local_max = fmaxf(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, offset, warp_size));
+                        }
+                        new_max_vals[r] = fmaxf(row_max[r], local_max);
+                    }
 
-                        if (threadIdx.x < WMMA_N) {
-                            #pragma unroll
-                            for (int r = 0; r < WMMA_M; ++r) {
-                                if (row_max[r] < new_max_vals[r]) {
-                                    tile_rescale[r * WMMA_N + threadIdx.x] *= scale_vals[r];
-                                }
+                    {
+                        bool need_rescale = false;
+                        float scale_vals[WMMA_M];
+                        #pragma unroll
+                        for (int r = 0; r < WMMA_M; ++r) {
+                            float max_diff = row_max[r] - new_max_vals[r];
+                            float scale = expf(max_diff);
+                            *((uint32_t *)&scale) *= max_diff >= SOFTMAX_FTZ_THRESHOLD;
+                            scale_vals[r] = scale;
+                            if (row_max[r] < new_max_vals[r]) {
+                                need_rescale = true;
                             }
                         }
-                        __syncthreads();
+
+                        if (need_rescale) {
+                            #pragma unroll
+                            for (int t = 0; t < DV_tiles; ++t) {
+                                wmma::store_matrix_sync(
+                                    (half *)tile_rescale, VKQ_acc[t], WMMA_N, wmma::mem_row_major);
+                                __syncthreads();
+
+                                if (threadIdx.x < WMMA_N) {
+                                    #pragma unroll
+                                    for (int r = 0; r < WMMA_M; ++r) {
+                                        if (row_max[r] < new_max_vals[r]) {
+                                            tile_rescale[r * WMMA_N + threadIdx.x] *= scale_vals[r];
+                                        }
+                                    }
+                                }
+                                __syncthreads();
+
+                                wmma::load_matrix_sync(
+                                    VKQ_acc[t], (half *)tile_rescale, WMMA_N, wmma::mem_row_major);
+                            }
+                        }
+                    }
+
+                    #pragma unroll
+                    for (int r = 0; r < WMMA_M; ++r) {
+                        row_max[r] = new_max_vals[r];
+                        float local_sum = 0.0f;
+#pragma unroll
+                    for (int c = threadIdx.x; c < WMMA_N && c < kv_sub_count; c += warp_size) {
+                        const int offset = (warp_q_row + r) * stride_S_h + kv_sub + c;
+                        float score = __half2float(tile_S[offset]);
+                        if (mask_ptr) {
+                            const int j_local = (warp_q_row + r) / ncols2;
+                            score += __half2float(tile_mask[j_local * (nbatch_fa + 8) + kv_sub + c]);
+                        }
+                        const float diff = score - new_max_vals[r];
+                            const float val = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : expf(diff);
+                            tile_S[offset] = __float2half(val);
+                            local_sum += val;
+                        }
+                        #pragma unroll
+                        for (int offset = 16; offset > 0; offset >>= 1) {
+                            local_sum += __shfl_xor_sync(0xFFFFFFFF, local_sum, offset, warp_size);
+                        }
+                        row_sum[r] = row_sum[r] * scale_vals[r] + local_sum;
+                    }
+                    __syncthreads();
+                }
+
+                // ---- Phase B: Load V tile ----
+                if (kv_count < nbatch_fa) {
+                    const int tid = threadIdx.x + threadIdx.y * warp_size;
+                    const int nt  = blockDim.x * blockDim.y;
+                    for (int idx = tid; idx < nbatch_fa * stride_V_h; idx += nt) {
+                        tile_KV[idx] = __float2half(0.0f);
+                    }
+                    __syncthreads();
+                }
+                load_KV_tile<stride_V_h>(V_raw + kv_start * nb21, tile_KV, kv_count, DV, nb21, kv_V_type);
+                __syncthreads();
+
+                // ---- Phase B: O = P * V via WMMA ----
+                #pragma unroll
+                for (int kv_sub = 0; kv_sub < kv_count; kv_sub += WMMA_N) {
+                    #pragma unroll
+                    for (int t = 0; t < DV_tiles; ++t) {
+                        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> P_frag;
+                        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> V_frag;
 
                         wmma::load_matrix_sync(
-                            VKQ_acc[t], (half *)tile_rescale, WMMA_N, wmma::mem_row_major);
+                            P_frag,
+                            tile_S + warp_q_row * stride_S_h + kv_sub,
+                            stride_S_h);
+
+                        wmma::load_matrix_sync(
+                            V_frag,
+                            tile_KV + kv_sub * stride_V_h + t * WMMA_K,
+                            stride_V_h);
+
+                        wmma::mma_sync(VKQ_acc[t], P_frag, V_frag, VKQ_acc[t]);
                     }
                 }
             }
-
-            // Step 3: compute exp, update state, write P back
-            #pragma unroll
-            for (int r = 0; r < WMMA_M; ++r) {
-                row_max[r] = new_max_vals[r];
-
-                float local_sum = 0.0f;
-                #pragma unroll
-                for (int c = threadIdx.x; c < WMMA_N && c < kv_sub_count; c += warp_size) {
-                    const int offset = (warp_q_row + r) * stride_S_h + kv_sub + c;
-                    const float diff = __half2float(tile_S[offset]) - new_max_vals[r];
-                    const float val = diff < SOFTMAX_FTZ_THRESHOLD ? 0.0f : expf(diff);
-                    tile_S[offset] = __float2half(val);
-                    local_sum += val;
-                }
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1) {
-                    local_sum += __shfl_xor_sync(0xFFFFFFFF, local_sum, offset, warp_size);
-                }
-                row_sum[r] = row_sum[r] * scale_vals[r] + local_sum;
-            }
-            __syncthreads();
         }
 
-        // ---- Phase B: Load V tile ----
-        if (kv_count < nbatch_fa) {
-            const int tid = threadIdx.x + threadIdx.y * warp_size;
-            const int nt  = blockDim.x * blockDim.y;
-            for (int idx = tid; idx < nbatch_fa * stride_V_h; idx += nt) {
-                tile_KV[idx] = __float2half(0.0f);
-            }
-            __syncthreads();
-        }
-        load_KV_tile<stride_V_h>(V_raw + kv_start * nb21, tile_KV, kv_count, DV, nb21, kv_V_type);
-        __syncthreads();
+        // ---- Output: write normalized VKQ to global memory ----
+        if (warp_q_row < ncols) {
+            float2 * dst_f2 = ((float2 *)dst_ptr) + (seq * ne01.z * ne02 + zt_Q) * (DV/2);
 
-        // ---- Phase B: Compute O = P * V via WMMA ----
-        #pragma unroll
-        for (int kv_sub = 0; kv_sub < kv_count; kv_sub += WMMA_N) {
             #pragma unroll
             for (int t = 0; t < DV_tiles; ++t) {
-                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> P_frag;
-                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> V_frag;
+                wmma::store_matrix_sync(
+                    (half *)tile_rescale, VKQ_acc[t], WMMA_N, wmma::mem_row_major);
+                __syncthreads();
 
-                wmma::load_matrix_sync(
-                    P_frag,
-                    tile_S + warp_q_row * stride_S_h + kv_sub,
-                    stride_S_h);
+                const int dv_base = t * WMMA_K;
+                const int tid = threadIdx.x + threadIdx.y * warp_size;
+                const int nt  = blockDim.x * blockDim.y;
+                const int total_pairs = WMMA_M * (WMMA_N / 2);
+                #pragma unroll
+                for (int idx = tid; idx < total_pairs; idx += nt) {
+                    const int r      = idx / (WMMA_N / 2);
+                    const int c_pair = idx % (WMMA_N / 2);
+                    const int c0     = c_pair * 2;
+                    const int c1     = c0 + 1;
+                    const int dv0    = dv_base + c0;
+                    const int dv1    = dv_base + c1;
 
-                wmma::load_matrix_sync(
-                    V_frag,
-                    tile_KV + kv_sub * stride_V_h + t * WMMA_K,
-                    stride_V_h);
+                    if (dv1 >= DV) continue;
 
-                wmma::mma_sync(VKQ_acc[t], P_frag, V_frag, VKQ_acc[t]);
+                    const float inv_sum = 1.0f / fmaxf(row_sum[r], 1e-10f);
+                    const float v0 = tile_rescale[r * WMMA_N + c0] * inv_sum;
+                    const float v1 = tile_rescale[r * WMMA_N + c1] * inv_sum;
+
+                    const int j      = (warp_q_row + r) / ncols2;
+                    const int c_head = (warp_q_row + r) % ncols2;
+                    const int64_t token = (int64_t)jt * ncols1 + j;
+                    const int64_t head  = zt_Q + c_head;
+                    const int64_t f2_idx = (token * ne02 + head) * (DV/2) + dv0/2;
+
+                    dst_f2[f2_idx] = make_float2(v0, v1);
+                }
+                __syncthreads();
             }
         }
+
+        // Advance to next tile in stream-K range
+        kbc += iter_k;
+        kbc -= kbc % iter_k;
+        if (kbc > kbc_stop) kbc = kbc_stop;
+        if (kbc >= total_tiles) break;
     }
 
-    // ---- Final normalization and output ----
-    {
-        float2 * dst_f2 = ((float2 *)dst_ptr) + (seq * ne01.z * ne02 + zt_Q) * (DV/2);
+    // No fixup meta for the simple non-fixup case
+    // (In a full stream-K implementation, needs_fixup would write KQ_max/rowsum to dst_meta)
 
-        #pragma unroll
-        for (int t = 0; t < DV_tiles; ++t) {
-            // Store VKQ tile to rescale buffer
-            wmma::store_matrix_sync(
-                (half *)tile_rescale, VKQ_acc[t], WMMA_N, wmma::mem_row_major);
-            __syncthreads();
-
-            const int dv_base = t * WMMA_K;
-            const int tid = threadIdx.x + threadIdx.y * warp_size;
-            const int nt  = blockDim.x * blockDim.y;
-
-            // Each thread writes one float2 (2 consecutive DV elements)
-            const int total_pairs = WMMA_M * (WMMA_N / 2);
-            #pragma unroll
-            for (int idx = tid; idx < total_pairs; idx += nt) {
-                const int r      = idx / (WMMA_N / 2);
-                const int c_pair = idx % (WMMA_N / 2);
-                const int c0     = c_pair * 2;
-                const int c1     = c0 + 1;
-                const int dv0    = dv_base + c0;
-                const int dv1    = dv_base + c1;
-
-                if (dv1 >= DV) continue;
-
-                const float inv_sum = 1.0f / fmaxf(row_sum[r], 1e-10f);
-                const float v0 = tile_rescale[r * WMMA_N + c0] * inv_sum;
-                const float v1 = tile_rescale[r * WMMA_N + c1] * inv_sum;
-
-                const int j      = (warp_q_row + r) / ncols2;
-                const int c_head = (warp_q_row + r) % ncols2;
-                const int64_t token = (int64_t)jt * ncols1 + j;
-                const int64_t head  = zt_Q + c_head;
-                const int64_t f2_idx = (token * ne02 + head) * (DV/2) + dv0/2;
-
-                dst_f2[f2_idx] = make_float2(v0, v1);
-            }
-            __syncthreads();
-        }
-    }
-
-    GGML_UNUSED_VARS(Q_f2, stride_Q1, stride_Q2, gqa_ratio,
-        mask_ptr, sinks_ptr, KV_max_ptr, dst_meta_ptr,
-        max_bias, m0, m1, n_head_log2, ne00, ne01, ne02, ne03,
+    GGML_UNUSED_VARS(KV_max_ptr, dst_meta_ptr,
+        max_bias, m0, m1, n_head_log2, ne00, ne02, ne03,
         ne11, ne12, ne13, nb12, nb13, nb22, nb23,
         ne31, ne32, ne33, nb31, nb32, nb33);
 
@@ -529,13 +601,14 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70_case(ggml_backend_cuda_context & 
     constexpr int max_batch  = max_by_DKQ < max_by_DV ? max_by_DKQ : max_by_DV;
     constexpr int nbatch_fa  = (max_batch > 128 ? 128 : (max_batch > 0 ? (max_batch / 16) * 16 : 16));
 
-    // Shared memory: Q tile + KV tile (shared by K and V) + rescale buffer (16x16 float)
+    // Shared memory: Q tile + KV tile + rescale buffer + mask tile
     constexpr size_t nbytes_shared_Q  = ncols * stride_Q_h * sizeof(half);
     constexpr size_t nbytes_shared_KV = nbatch_fa * (stride_K_h > stride_V_h ? stride_K_h : stride_V_h) * sizeof(half);
     constexpr size_t nbytes_shared_S  = ncols * (nbatch_fa + WMMA_PADDING) * sizeof(half);
     constexpr size_t nbytes_shared_Q_or_S = nbytes_shared_Q > nbytes_shared_S ? nbytes_shared_Q : nbytes_shared_S;
     constexpr size_t nbytes_shared_rescale = WMMA_M * WMMA_N * sizeof(float); // 1024 bytes
-    constexpr size_t nbytes_shared_total = nbytes_shared_Q_or_S + nbytes_shared_KV + nbytes_shared_rescale;
+    constexpr size_t nbytes_shared_mask = ncols1 * (nbatch_fa + WMMA_PADDING) * sizeof(half);
+    constexpr size_t nbytes_shared_total = nbytes_shared_Q_or_S + nbytes_shared_KV + nbytes_shared_rescale + nbytes_shared_mask;
 
     // Compute grid dimensions: one block per output tile
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
@@ -544,7 +617,6 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70_case(ggml_backend_cuda_context & 
     const int total_tiles  = iter_j * iter_z_gqa * K->ne[2] * Q->ne[3];
 
     const dim3 block_dim(32, nwarps, 1);
-    const dim3 grid_dim(total_tiles, 1, 1);
     const uint3 ne01_fd = init_fastdiv_values(Q->ne[1]);
 
     float scale_val = 1.0f;
@@ -564,38 +636,12 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70_case(ggml_backend_cuda_context & 
         constexpr bool use_lsc = false;
         auto kernel = flash_attn_ext_f16_sm70<DKQ, DV, ncols1, ncols2, use_lsc, V_is_K_view>;
         CUDA_CHECK(cudaFuncSetAttribute((const void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)nbytes_shared_total));
-        kernel<<<grid_dim, block_dim, nbytes_shared_total, ctx.stream()>>>(
-            (const char *)Q->data, K_data, V_data,
-            (const char *)nullptr,
-            (const char *)nullptr,
-            (const int   *)nullptr,
-            (float       *)dst->data,
-            (float2      *)nullptr,
-            scale_val, 0.0f, 0.0f, 0.0f, (uint32_t)0, logit_softcap,
-            Q->ne[0], ne01_fd, Q->ne[2], Q->ne[3],
-            (int32_t)Q->nb[1], (int32_t)Q->nb[2], (int32_t)Q->nb[3],
-            K->ne[0], K->ne[1], K->ne[2], K->ne[3],
-            (int32_t)K->nb[1], (int32_t)K->nb[2], (int64_t)K->nb[3],
-            (int32_t)V->nb[1], (int32_t)V->nb[2], (int64_t)V->nb[3],
-            0, 0, 0, 0, 0, 0, 0);
+        launch_fattn<DV, ncols1, ncols2>(ctx, dst, kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, 32);
     } else {
         constexpr bool use_lsc = true;
         auto kernel = flash_attn_ext_f16_sm70<DKQ, DV, ncols1, ncols2, use_lsc, V_is_K_view>;
         CUDA_CHECK(cudaFuncSetAttribute((const void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)nbytes_shared_total));
-        kernel<<<grid_dim, block_dim, nbytes_shared_total, ctx.stream()>>>(
-            (const char *)Q->data, K_data, V_data,
-            (const char *)nullptr,
-            (const char *)nullptr,
-            (const int   *)nullptr,
-            (float       *)dst->data,
-            (float2      *)nullptr,
-            scale_val, 0.0f, 0.0f, 0.0f, (uint32_t)0, logit_softcap,
-            Q->ne[0], ne01_fd, Q->ne[2], Q->ne[3],
-            (int32_t)Q->nb[1], (int32_t)Q->nb[2], (int32_t)Q->nb[3],
-            K->ne[0], K->ne[1], K->ne[2], K->ne[3],
-            (int32_t)K->nb[1], (int32_t)K->nb[2], (int64_t)K->nb[3],
-            (int32_t)V->nb[1], (int32_t)V->nb[2], (int64_t)V->nb[3],
-            0, 0, 0, 0, 0, 0, 0);
+        launch_fattn<DV, ncols1, ncols2>(ctx, dst, kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, 32);
     }
 }
 
