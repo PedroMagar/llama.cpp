@@ -253,7 +253,7 @@ static __global__ void flash_attn_ext_f16_sm70(
     constexpr int nbatch_fa = wmma_get_nbatch_fa(DKQ, DV, ncols, ncols1);
 
     constexpr int stride_S_h   = nbatch_fa + WMMA_PADDING;
-    constexpr int nKV_blocks   = (ne11 + nbatch_fa - 1) / nbatch_fa;
+    const int nKV_blocks       = (ne11 + nbatch_fa - 1) / nbatch_fa;
     const int iter_k           = nKV_blocks;
 
     constexpr int smem_QKV_offset = ncols * (stride_Q_h > stride_S_h ? stride_Q_h : stride_S_h);
@@ -347,14 +347,14 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
                 #pragma unroll
                 for (int t = 0; t < DV_tiles; ++t) {
                     wmma::store_matrix_sync(
-                        (half *)rescale_w, VKQ_acc[t], WMMA_N, wmma::mem_row_major);
+                        rescale_w, VKQ_acc[t], WMMA_N, wmma::mem_row_major);
                     __syncwarp();
                     if (threadIdx.x < WMMA_N) {
                         rescale_w[(r % WMMA_N) * WMMA_N + threadIdx.x] *= scale;
                     }
                     __syncwarp();
                     wmma::load_matrix_sync(
-                        VKQ_acc[t], (half *)rescale_w, WMMA_N, wmma::mem_row_major);
+                        VKQ_acc[t], rescale_w, WMMA_N, wmma::mem_row_major);
                 }
                 row_max[r] = new_max;
                 row_sum[r] = row_sum[r] * scale + expf(sink - new_max);
@@ -396,7 +396,7 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
             for (int kv_sub = 0; kv_sub < kv_count; kv_sub += WMMA_N) {
                 const int kv_sub_count = min(WMMA_N, kv_count - kv_sub);
 
-                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> S_frag;
+                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> S_frag;
                 wmma::fill_fragment(S_frag, 0.0f);
 
                 for (int dkq = 0; dkq < DKQ; dkq += WMMA_K) {
@@ -411,7 +411,7 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
                 if (use_logit_softcap) {
                     #pragma unroll
                     for (int l = 0; l < decltype(S_frag)::ne; ++l) {
-                        S_frag.x[l] = logit_softcap * tanhf(S_frag.x[l] / logit_softcap);
+                        S_frag.x[l] = __float2half(logit_softcap * tanhf(__half2float(S_frag.x[l]) / logit_softcap));
                     }
                 }
 
@@ -454,7 +454,7 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
                         #pragma unroll
                         for (int t = 0; t < DV_tiles; ++t) {
                             wmma::store_matrix_sync(
-                                (half *)rescale_w, VKQ_acc[t], WMMA_N, wmma::mem_row_major);
+                                rescale_w, VKQ_acc[t], WMMA_N, wmma::mem_row_major);
                             __syncwarp();
 
                             if (threadIdx.x < WMMA_N) {
@@ -468,7 +468,7 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
                             __syncwarp();
 
                             wmma::load_matrix_sync(
-                                VKQ_acc[t], (half *)rescale_w, WMMA_N, wmma::mem_row_major);
+                                VKQ_acc[t], rescale_w, WMMA_N, wmma::mem_row_major);
                         }
                     }
                 }
@@ -542,7 +542,7 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
         #pragma unroll
         for (int t = 0; t < DV_tiles; ++t) {
             wmma::store_matrix_sync(
-                (half *)rescale_w, VKQ_acc[t], WMMA_N, wmma::mem_row_major);
+                rescale_w, VKQ_acc[t], WMMA_N, wmma::mem_row_major);
             __syncwarp();
 
             const int dv_base = t * WMMA_K;
