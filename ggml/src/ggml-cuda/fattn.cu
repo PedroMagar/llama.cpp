@@ -467,15 +467,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // Volta-family (sm_70/sm_72): prefer the native WMMA kernel over the
         // PTX-based MMA path which only has NO_DEVICE_CODE for these GPUs.
-    if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+    if (volta_mma_available(cc) && Q->ne[0] <= 128 && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
         if (Q->ne[1] * gqa_ratio_eff <= 16) {
             return BEST_FATTN_KERNEL_TILE; // On Volta tensor cores are only faster for sufficiently large matrices.
         }
-        // Volta (sm_70): route to native WMMA SM70 kernel
-        return BEST_FATTN_KERNEL_SM70;
+        // The SM70 WMMA kernel handles F16/Q4_0/Q8_0 KV cache on-the-fly. F32 and BF16
+        // are left on the generic TILE path, which converts them to F16 first.
+        const bool sm70_kv_types = (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q8_0) &&
+                                   (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0);
+        if (sm70_kv_types) {
+            return BEST_FATTN_KERNEL_SM70;
+        }
     }
 
     // If Turing tensor cores are available, use them:
