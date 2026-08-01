@@ -11,6 +11,7 @@
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 #include <cuda_fp16.h>
+#include <mma.h>
 
 namespace wmma = nvcuda::wmma;
 
@@ -145,11 +146,11 @@ __device__ void load_Q_tile(
     const float sf = __half2float(scale_h);
 
     // Each thread loads one or more float2 pairs and expands to 2 half elements.
-    const int total_f2 = nrows * (DKQ/2);
+    const int total_f2 = nrows * (ncols/2);
     for (int idx = tid; idx < total_f2; idx += nt) {
-        const int jc = idx / (DKQ/2);
-        const int k  = idx % (DKQ/2);
-        const int j  = (jt * ncols1) + (jc / ncols2);
+        const int jc = idx / (ncols/2);
+        const int k  = idx % (ncols/2);
+        const int j  = jt * (nrows/ncols2) + (jc / ncols2);
         const int c  = jc % ncols2;
 
         const float2 tmp = src[j * stride_Q1 + c * stride_Q2 + k];
