@@ -312,6 +312,7 @@ static __global__ void flash_attn_ext_f16_sm70(
     float row_max[WMMA_M];
     float row_sum[WMMA_M];
     constexpr int DV_tiles = DV / WMMA_K;
+    constexpr int S_frag_ne = WMMA_M * WMMA_N / warp_size * (sizeof(float) / sizeof(half));
 wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tiles];
 
     // Initialize softmax state
@@ -410,7 +411,7 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
 
                 if (use_logit_softcap) {
                     #pragma unroll
-                    for (int l = 0; l < decltype(S_frag)::ne; ++l) {
+                    for (int l = 0; l < S_frag_ne; ++l) {
                         S_frag.x[l] = __float2half(logit_softcap * tanhf(__half2float(S_frag.x[l]) / logit_softcap));
                     }
                 }
@@ -422,6 +423,8 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
 
                 // Online softmax
                 float new_max_vals[WMMA_M];
+                float scale_vals[WMMA_M];
+                bool need_rescale = false;
                 #pragma unroll
                 for (int r = 0; r < WMMA_M; ++r) {
                     float local_max = -FLT_MAX;
@@ -434,42 +437,35 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
                         local_max = fmaxf(local_max, __shfl_xor_sync(0xFFFFFFFF, local_max, offset, warp_size));
                     }
                     new_max_vals[r] = fmaxf(row_max[r], local_max + FATTN_KQ_MAX_OFFSET);
+
+                    float max_diff = row_max[r] - new_max_vals[r];
+                    float scale = expf(max_diff);
+                    *((uint32_t *)&scale) *= max_diff >= SOFTMAX_FTZ_THRESHOLD;
+                    scale_vals[r] = scale;
+                    if (row_max[r] < new_max_vals[r]) {
+                        need_rescale = true;
+                    }
                 }
 
-                {
-                    bool need_rescale = false;
-                    float scale_vals[WMMA_M];
+                if (need_rescale) {
                     #pragma unroll
-                    for (int r = 0; r < WMMA_M; ++r) {
-                        float max_diff = row_max[r] - new_max_vals[r];
-                        float scale = expf(max_diff);
-                        *((uint32_t *)&scale) *= max_diff >= SOFTMAX_FTZ_THRESHOLD;
-                        scale_vals[r] = scale;
-                        if (row_max[r] < new_max_vals[r]) {
-                            need_rescale = true;
-                        }
-                    }
+                    for (int t = 0; t < DV_tiles; ++t) {
+                        wmma::store_matrix_sync(
+                            rescale_w, VKQ_acc[t], WMMA_N, wmma::mem_row_major);
+                        __syncwarp();
 
-                    if (need_rescale) {
-                        #pragma unroll
-                        for (int t = 0; t < DV_tiles; ++t) {
-                            wmma::store_matrix_sync(
-                                rescale_w, VKQ_acc[t], WMMA_N, wmma::mem_row_major);
-                            __syncwarp();
-
-                            if (threadIdx.x < WMMA_N) {
-                                #pragma unroll
-                                for (int r = 0; r < WMMA_M; ++r) {
-                                    if (row_max[r] < new_max_vals[r]) {
-                                        rescale_w[r * WMMA_N + threadIdx.x] *= scale_vals[r];
-                                    }
+                        if (threadIdx.x < WMMA_N) {
+                            #pragma unroll
+                            for (int r = 0; r < WMMA_M; ++r) {
+                                if (row_max[r] < new_max_vals[r]) {
+                                    rescale_w[r * WMMA_N + threadIdx.x] *= scale_vals[r];
                                 }
                             }
-                            __syncwarp();
-
-                            wmma::load_matrix_sync(
-                                VKQ_acc[t], rescale_w, WMMA_N, wmma::mem_row_major);
                         }
+                        __syncwarp();
+
+                        wmma::load_matrix_sync(
+                            VKQ_acc[t], rescale_w, WMMA_N, wmma::mem_row_major);
                     }
                 }
 
