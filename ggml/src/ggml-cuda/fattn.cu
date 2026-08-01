@@ -333,8 +333,8 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_VEC      = 100,
-    BEST_FATTN_KERNEL_WMMA_F16 = 300,
     BEST_FATTN_KERNEL_MMA_F16  = 400,
+    BEST_FATTN_KERNEL_WMMA_F16 = 300,
 };
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
@@ -580,28 +580,6 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
-// Volta-family (sm_70/sm_72) WMMA flash attention kernel
-static void ggml_cuda_flash_attn_ext_sm70(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * Q = dst->src[0];
-    const ggml_tensor * K = dst->src[1];
-    const ggml_tensor * V = dst->src[2];
-
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
-
-    GGML_ASSERT(volta_mma_available(cc));
-    GGML_ASSERT(Q->type == GGML_TYPE_F32);
-    GGML_ASSERT(K->type == GGML_TYPE_F16 || ggml_is_quantized(K->type));
-    GGML_ASSERT(V->type == GGML_TYPE_F16 || ggml_is_quantized(V->type));
-
-    const int64_t D  = Q->ne[0];
-    const int64_t Dv = V->ne[0];
-
-    GGML_ASSERT(D  <= 128);
-    GGML_ASSERT(Dv <= 128);
-
-    ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst);
-}
-
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
@@ -614,7 +592,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_WMMA_F16:
-            ggml_cuda_flash_attn_ext_sm70(ctx, dst);
+            ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);

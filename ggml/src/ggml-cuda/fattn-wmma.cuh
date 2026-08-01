@@ -734,7 +734,17 @@ static void ggml_cuda_flash_attn_ext_wmma_f16_switch_ncols2(ggml_backend_cuda_co
 
 static void ggml_cuda_flash_attn_ext_wmma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
+
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+
+    GGML_ASSERT(volta_mma_available(cc));
+    GGML_ASSERT(Q->type == GGML_TYPE_F32);
+    GGML_ASSERT(K->type == GGML_TYPE_F16 || ggml_is_quantized(K->type));
+    GGML_ASSERT(V->type == GGML_TYPE_F16 || ggml_is_quantized(V->type));
+    GGML_ASSERT(Q->ne[0] <= 128);
+    GGML_ASSERT(V->ne[0] <= 128);
 
     switch (Q->ne[0]) {
         case 64:
