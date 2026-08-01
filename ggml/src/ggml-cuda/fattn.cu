@@ -330,11 +330,11 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE    =   0,
-    BEST_FATTN_KERNEL_VEC     = 100,
-    BEST_FATTN_KERNEL_TILE    = 200,
-    BEST_FATTN_KERNEL_SM70    = 300,
-    BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_NONE     =   0,
+    BEST_FATTN_KERNEL_TILE     = 200,
+    BEST_FATTN_KERNEL_VEC      = 100,
+    BEST_FATTN_KERNEL_WMMA_F16 = 300,
+    BEST_FATTN_KERNEL_MMA_F16  = 400,
 };
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
@@ -465,8 +465,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         gqa_ratio_eff *= 2;
     }
 
-    // Volta-family (sm_70/sm_72): prefer the native WMMA kernel over the
-        // PTX-based MMA path which only has NO_DEVICE_CODE for these GPUs.
+    // Volta (sm_70/sm_72): prefer the WMMA kernel for large batches; the generic
+    // MMA path only has NO_DEVICE_CODE for these GPUs.
     if (volta_mma_available(cc) && Q->ne[0] <= 128 && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
@@ -474,12 +474,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (Q->ne[1] * gqa_ratio_eff <= 16) {
             return BEST_FATTN_KERNEL_TILE; // On Volta tensor cores are only faster for sufficiently large matrices.
         }
-        // The SM70 WMMA kernel handles F16/Q4_0/Q8_0 KV cache on-the-fly. F32 and BF16
-        // are left on the generic TILE path, which converts them to F16 first.
-        const bool sm70_kv_types = (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q8_0) &&
+        // The WMMA kernel dequantizes F16/Q4_0/Q8_0 KV cache on-the-fly; F32 and
+        // BF16 KV fall back to the TILE path, which converts them to F16 first.
+        const bool wmma_kv_types = (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q8_0) &&
                                    (V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q4_0 || V->type == GGML_TYPE_Q8_0);
-        if (sm70_kv_types) {
-            return BEST_FATTN_KERNEL_SM70;
+        if (wmma_kv_types) {
+            return BEST_FATTN_KERNEL_WMMA_F16;
         }
     }
 
@@ -567,9 +567,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
-        case BEST_FATTN_KERNEL_SM70:
-            // SM70 WMMA kernel dequantizes KV cache on-the-fly,
-            // no pre-conversion to f16 needed.
+        case BEST_FATTN_KERNEL_WMMA_F16:
+            // The WMMA kernel dequantizes the KV cache on-the-fly, so no f16 conversion is needed.
             break;
         case BEST_FATTN_KERNEL_NONE:
             break;
@@ -581,7 +580,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
-// SM70 (Volta) WMMA flash attention kernel
+// Volta-family (sm_70/sm_72) WMMA flash attention kernel
 static void ggml_cuda_flash_attn_ext_sm70(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -614,7 +613,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_VEC:
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
-        case BEST_FATTN_KERNEL_SM70:
+        case BEST_FATTN_KERNEL_WMMA_F16:
             ggml_cuda_flash_attn_ext_sm70(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
