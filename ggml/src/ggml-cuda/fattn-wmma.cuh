@@ -3,10 +3,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 
-//
-// Volta (sm_70/sm_72) Flash Attention kernel using nvcuda::wmma Tensor Cores (m16n16k16).
-// Compiles for __CUDA_ARCH__ >= 700 and < 750 (Volta family only).
-//
+// Volta (sm_70): flash attention kernel using nvcuda::wmma tensor cores (m16n16k16).
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
@@ -15,18 +12,18 @@
 
 namespace wmma = nvcuda::wmma;
 
-// Tile with 8 half-element padding per row for bank-conflict-free access:
+// padding per row for bank-conflict-free shared memory access
 constexpr int WMMA_PADDING = 8;
 
-// WMMA m16n16k16: each warp handles 16 Q rows per tile
+// WMMA m16n16k16 layout
 constexpr int WMMA_M = 16;
 constexpr int WMMA_N = 16;
 constexpr int WMMA_K = 16;
 
-// Largest multiple-of-16 KV batch that keeps the Q/KV/S/mask tiles and the per-warp
-// float rescale slots within Volta's 64KB (minus 1KB driver reserve) shared memory limit.
-// Shared between the host-side allocation and the device kernel so they must agree.
-static __host__ __device__ constexpr int wmma_get_nbatch_fa(int dkq, int dv, int ncols, int ncols1) {
+// Largest multiple-of-16 KV batch that keeps all shared tiles (Q/KV/S/mask and the
+// per-warp rescale slots) within Volta's 64KB minus 1KB driver reserve. Kept in sync
+// between the host-side allocation and the device kernel.
+static __host__ __device__ constexpr int ggml_cuda_fattn_wmma_get_nbatch_fa(int dkq, int dv, int ncols, int ncols1) {
     constexpr int max_shared = 63*1024;
     for (int n = 128; n >= WMMA_N; n -= WMMA_N) {
         const int q_d = dkq + WMMA_PADDING;
@@ -45,10 +42,7 @@ static __host__ __device__ constexpr int wmma_get_nbatch_fa(int dkq, int dv, int
     return WMMA_N;
 }
 
-// -----------------------------------------------------------------------
-// On-the-fly dequantization helpers: quantized block -> half elements
-// -----------------------------------------------------------------------
-
+// dequantize quantized blocks to half elements
 __device__ __forceinline__ void dequant_q4_0_to_half(const block_q4_0 & blk, half * out) {
     const float df = __half2float(blk.d);
     #pragma unroll
@@ -67,13 +61,9 @@ __device__ __forceinline__ void dequant_q8_0_to_half(const block_q8_0 & blk, hal
     }
 }
 
-// -----------------------------------------------------------------------
-// KV tile loader: global memory -> shared memory with on-the-fly dequant
-// -----------------------------------------------------------------------
-
 enum class KVType : int { F16, Q4_0, Q8_0 };
 
-// Detect KV type from byte stride nb1 and column count ncols
+// detect K/V type from its byte stride and column count
 __device__ __forceinline__ KVType detect_kv_type(int64_t nb1, int ncols) {
     // F16: each element is sizeof(half) = 2 bytes
     if (nb1 == (int64_t)ncols * (int64_t)sizeof(half)) {
@@ -87,14 +77,12 @@ __device__ __forceinline__ KVType detect_kv_type(int64_t nb1, int ncols) {
     if (nb1 >= (int64_t)(ncols / QK8_0) * (int64_t)sizeof(block_q8_0)) {
         return KVType::Q8_0;
     }
-    // Fallback with a loose check for padded tensors
+    // default to F16
     return KVType::F16;
 }
 
-// Load a tile of K or V from global memory into shared memory.
-// nrows = nbatch_fa, ncols = DKQ (or DV for V).
-// Global memory layout is row-major with stride nb1 (bytes between rows).
-// Shared memory layout is row-major with stride smem_stride (half elements).
+// Load a K or V tile from global (row-major, byte stride nb1) to shared memory
+// (row-major, half-element stride smem_stride). nrows = nbatch_fa, ncols = DKQ (or DV).
 template<int smem_stride>
 __device__ void load_KV_tile(
     const char * src, half * dst, int nrows, int ncols,
@@ -151,13 +139,8 @@ __device__ void load_KV_tile(
     }
 }
 
-// -----------------------------------------------------------------------
-// Q tile loader: F32 global memory -> half shared memory with scale
-// -----------------------------------------------------------------------
-
-// Load Q tile from F32 global memory into half shared memory with scale.
-// Q global layout: [seq][head][token][dkq/2] as float2, stride_Q1 = tokens, stride_Q2 = heads.
-// Shared memory: [ncols x DKQ] half elements with stride smem_stride.
+// Load Q from global F32 into half shared memory with scale.
+// Q layout: [seq][head][token][dkq/2] as float2; strides in token (stride_Q1) and head (stride_Q2).
 template<int smem_stride>
 __device__ void load_Q_tile(
     const float2 * src, half * dst, int nrows, int ncols,
@@ -168,7 +151,6 @@ __device__ void load_Q_tile(
     const int nt  = blockDim.x * blockDim.y;
     const float sf = __half2float(scale_h);
 
-    // Each thread loads one or more float2 pairs and expands to 2 half elements.
     const int total_f2 = nrows * (ncols/2);
     for (int idx = tid; idx < total_f2; idx += nt) {
         const int jc = idx / (ncols/2);
@@ -187,33 +169,27 @@ __device__ void load_Q_tile(
     }
 }
 
-// -----------------------------------------------------------------------
-// Mask tile loader: global memory -> shared memory
-// -----------------------------------------------------------------------
-
 __device__ __forceinline__ void load_mask_tile(
     const half * mask_h, half * tile_mask,
-    int stride_mask, int kv_count, int j0, int ncols1_val, int nbatch_fa_val,
+    int stride_mask, int kv_count, int j0, int ncols1, int nbatch_fa,
     int token_count)
 {
     const int warp_size = 32;
     const int tid = threadIdx.x + threadIdx.y * warp_size;
     const int nt  = blockDim.x * blockDim.y;
 
-    const int total_half = ncols1_val * kv_count;
+    const int total_half = ncols1 * kv_count;
     for (int idx = tid; idx < total_half; idx += nt) {
         const int r = idx / kv_count;
         const int c = idx % kv_count;
         const int j_vram = j0 + r;
-        tile_mask[r * (nbatch_fa_val + 8) + c] = j_vram < token_count
+        tile_mask[r * (nbatch_fa + 8) + c] = j_vram < token_count
             ? mask_h[j_vram * stride_mask + c]
             : __float2half(0.0f);
     }
 }
 
-// =========================================================================
-// Main WMMA Flash Attention kernel
-// =========================================================================
+// Main WMMA flash attention kernel
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view>
 __launch_bounds__(256, 2)
@@ -250,7 +226,7 @@ static __global__ void flash_attn_ext_f16_sm70(
     constexpr int stride_V_h  = DV  + WMMA_PADDING;
 
     // Largest KV batch that keeps all shared tiles within Volta's shared memory limit.
-    constexpr int nbatch_fa = wmma_get_nbatch_fa(DKQ, DV, ncols, ncols1);
+    constexpr int nbatch_fa = ggml_cuda_fattn_wmma_get_nbatch_fa(DKQ, DV, ncols, ncols1);
 
     constexpr int stride_S_h   = nbatch_fa + WMMA_PADDING;
     const int nKV_blocks       = (ne11 + nbatch_fa - 1) / nbatch_fa;
@@ -313,7 +289,7 @@ static __global__ void flash_attn_ext_f16_sm70(
     float row_sum[WMMA_M];
     constexpr int DV_tiles = DV / WMMA_K;
     constexpr int S_frag_ne = WMMA_M * WMMA_N / warp_size * (sizeof(float) / sizeof(half));
-wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tiles];
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tiles];
 
     // Initialize softmax state
     if (warp_q_row < ncols) {
@@ -327,14 +303,14 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
             wmma::fill_fragment(VKQ_acc[t], 0.0f);
         }
 
-        // ---- Q load: F32 -> half with scale ----
+        // load Q tile (F32 -> half)
         const half scale_h = __float2half(scale);
         const float2 * Q_src = Q_f2 + (seq * ne02 + zt_Q) * stride_Q2;
         load_Q_tile<stride_Q_h>(Q_src, tile_Q, ncols, DKQ, stride_Q1, stride_Q2, jt, ncols2, scale_h,
             ne01.z, ne02, zt_Q);
         __syncthreads();
 
-        // ---- Attention sinks ----
+        // apply attention sinks
         if (sinks_ptr) {
             const float * sinks_f = (const float *)sinks_ptr + zt_Q;
             #pragma unroll
@@ -364,7 +340,7 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
     }
     __syncthreads();
 
-    // ---- KV iteration loop ----
+    // iterate over KV blocks
     for (int kb = 0; kb < iter_k; ++kb) {
         const int kv_start = kb * nbatch_fa;
         if (kv_start >= ne11) break;
@@ -380,7 +356,7 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
                 __syncthreads();
             }
 
-            // ---- Phase A: Load K tile ----
+            // Phase A: load K tile
             load_KV_tile<stride_K_h>(K_raw + kv_start * nb11, tile_KV, kv_count, DKQ, nb11, kv_K_type);
             __syncthreads();
 
@@ -393,7 +369,7 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
                 __syncthreads();
             }
 
-            // ---- Phase A: S = Q * K^T + online softmax ----
+            // Phase A: S = Q*K^T and online softmax
             for (int kv_sub = 0; kv_sub < kv_count; kv_sub += WMMA_N) {
                 const int kv_sub_count = min(WMMA_N, kv_count - kv_sub);
 
@@ -495,7 +471,7 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
                 __syncthreads();
             }
 
-            // ---- Phase B: Load V tile ----
+            // Phase B: load V tile
             if (kv_count < nbatch_fa) {
                 const int tid = threadIdx.x + threadIdx.y * warp_size;
                 const int nt  = blockDim.x * blockDim.y;
@@ -507,7 +483,7 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
             load_KV_tile<stride_V_h>(V_raw + kv_start * nb21, tile_KV, kv_count, DV, nb21, kv_V_type);
             __syncthreads();
 
-            // ---- Phase B: O = P * V via WMMA ----
+            // Phase B: O = P*V
             #pragma unroll
             for (int kv_sub = 0; kv_sub < kv_count; kv_sub += WMMA_N) {
                 #pragma unroll
@@ -531,7 +507,7 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
         }
     }
 
-    // ---- Output: write normalized VKQ to global memory ----
+    // write normalized VKQ to global memory
     if (warp_q_row < ncols) {
         float2 * dst_f2 = (float2 *) dst_ptr;
 
@@ -594,7 +570,7 @@ wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> VKQ_acc[DV_tile
 //
 
 template <int DKQ, int DV, int ncols1, int ncols2>
-static void ggml_cuda_flash_attn_ext_wmma_sm70_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void ggml_cuda_flash_attn_ext_wmma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
     const ggml_tensor * Q   = dst->src[0];
     const ggml_tensor * K   = dst->src[1];
@@ -612,7 +588,7 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70_case(ggml_backend_cuda_context & 
     constexpr int stride_V_h = DV  + WMMA_PADDING;
 
     // Largest KV batch that keeps all shared tiles within Volta's shared memory limit.
-    constexpr int nbatch_fa = wmma_get_nbatch_fa(DKQ, DV, ncols, ncols1);
+    constexpr int nbatch_fa = ggml_cuda_fattn_wmma_get_nbatch_fa(DKQ, DV, ncols, ncols1);
 
     // Shared memory: Q tile + KV tile + per-warp rescale slots + mask tile
     constexpr size_t nbytes_shared_Q  = ncols * stride_Q_h * sizeof(half);
@@ -653,7 +629,7 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70_case(ggml_backend_cuda_context & 
     const char * K_data = (const char *) K->data;
     const char * V_data = (const char *) V->data;
 
-    // Real mask, sinks and KV_max pointers from tensor inputs
+    // mask and sinks pointers
     const ggml_tensor * mask_t = dst->src[3];
     const ggml_tensor * sinks_t = dst->src[4];
     const char * mask_d = mask_t ? (const char *)mask_t->data : nullptr;
@@ -691,22 +667,22 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70_case(ggml_backend_cuda_context & 
 //
 
 template <int DKQ, int DV, int ncols2>
-static void ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void ggml_cuda_flash_attn_ext_wmma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
 
     if (Q->ne[1] <= 16/ncols2) {
-        ggml_cuda_flash_attn_ext_wmma_sm70_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_wmma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
         return;
     }
     if (Q->ne[1] <= 32/ncols2) {
-        ggml_cuda_flash_attn_ext_wmma_sm70_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_wmma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
     if (Q->ne[1] <= 64/ncols2) {
-        ggml_cuda_flash_attn_ext_wmma_sm70_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_wmma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
         return;
     }
-    ggml_cuda_flash_attn_ext_wmma_sm70_case<DKQ, DV, 128/ncols2, ncols2>(ctx, dst);
+    ggml_cuda_flash_attn_ext_wmma_f16_case<DKQ, DV, 128/ncols2, ncols2>(ctx, dst);
 }
 
 //
@@ -714,7 +690,7 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols1(ggml_backend_cuda_c
 //
 
 template <int DKQ, int DV>
-static void ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void ggml_cuda_flash_attn_ext_wmma_f16_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * mask = dst->src[3];
@@ -738,48 +714,48 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols2(ggml_backend_cuda_c
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
     if (use_gqa_opt && gqa_ratio % 8 == 0) {
-        ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+        ggml_cuda_flash_attn_ext_wmma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
         return;
     }
     if (use_gqa_opt && gqa_ratio % 4 == 0) {
-        ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+        ggml_cuda_flash_attn_ext_wmma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
         return;
     }
     if (use_gqa_opt && gqa_ratio % 2 == 0) {
-        ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_wmma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
         return;
     }
-    ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+    ggml_cuda_flash_attn_ext_wmma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
 }
 
 //
 // Top-level dispatch: switch on head size (DKQ == DV)
 //
 
-static void ggml_cuda_flash_attn_ext_wmma_sm70(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void ggml_cuda_flash_attn_ext_wmma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * V = dst->src[2];
 
     switch (Q->ne[0]) {
         case 64:
             GGML_ASSERT(V->ne[0] == 64);
-            ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols2< 64,  64>(ctx, dst);
+            ggml_cuda_flash_attn_ext_wmma_f16_switch_ncols2< 64,  64>(ctx, dst);
             break;
         case 80:
             GGML_ASSERT(V->ne[0] == 80);
-            ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols2< 80,  80>(ctx, dst);
+            ggml_cuda_flash_attn_ext_wmma_f16_switch_ncols2< 80,  80>(ctx, dst);
             break;
         case 96:
             GGML_ASSERT(V->ne[0] == 96);
-            ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols2< 96,  96>(ctx, dst);
+            ggml_cuda_flash_attn_ext_wmma_f16_switch_ncols2< 96,  96>(ctx, dst);
             break;
         case 112:
             GGML_ASSERT(V->ne[0] == 112);
-            ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols2<112, 112>(ctx, dst);
+            ggml_cuda_flash_attn_ext_wmma_f16_switch_ncols2<112, 112>(ctx, dst);
             break;
         case 128:
             GGML_ASSERT(V->ne[0] == 128);
-            ggml_cuda_flash_attn_ext_wmma_sm70_switch_ncols2<128, 128>(ctx, dst);
+            ggml_cuda_flash_attn_ext_wmma_f16_switch_ncols2<128, 128>(ctx, dst);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -789,7 +765,7 @@ static void ggml_cuda_flash_attn_ext_wmma_sm70(ggml_backend_cuda_context & ctx, 
 
 #else // GGML_USE_HIP || GGML_USE_MUSA
 
-static void ggml_cuda_flash_attn_ext_wmma_sm70(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void ggml_cuda_flash_attn_ext_wmma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED(ctx); GGML_UNUSED(dst);
     GGML_ABORT("flash_attn_ext_f16_sm70: not available on this platform");
 }

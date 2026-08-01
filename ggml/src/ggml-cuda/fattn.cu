@@ -600,7 +600,7 @@ static void ggml_cuda_flash_attn_ext_sm70(ggml_backend_cuda_context & ctx, ggml_
     GGML_ASSERT(D  <= 128);
     GGML_ASSERT(Dv <= 128);
 
-    ggml_cuda_flash_attn_ext_wmma_sm70(ctx, dst);
+    ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst);
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
